@@ -1,0 +1,18 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "check_return_eligibility",
+      "args": {
+        "item_id": "TR-SHR-009",
+        "order_id": "TR-4528",
+        "issue_type": "wrong_size"
+      },
+      "id": "Z3FkcrTR"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "b627275ee7377b2b5fec9be6"
+  }
+}

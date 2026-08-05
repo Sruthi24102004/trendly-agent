@@ -1,0 +1,32 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "lookup_order",
+      "args": {
+        "order_id": "TR-4523"
+      },
+      "id": "zbQdwcJX"
+    },
+    {
+      "name": "search_policy",
+      "args": {
+        "topic": "return window"
+      },
+      "id": "VYxh1MnM"
+    },
+    {
+      "name": "check_return_eligibility",
+      "args": {
+        "issue_type": "change_of_mind",
+        "item_id": "TR-JKT-008",
+        "order_id": "TR-4523"
+      },
+      "id": "QKGIvlUZ"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "da9f2e04e84523a7734f3445"
+  }
+}

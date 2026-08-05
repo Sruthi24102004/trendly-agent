@@ -1,0 +1,25 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "lookup_order",
+      "args": {
+        "order_id": "TR-4523"
+      },
+      "id": "s5JtOrdv"
+    },
+    {
+      "name": "check_return_eligibility",
+      "args": {
+        "order_id": "TR-4523",
+        "item_id": "TR-JKT-008",
+        "issue_type": "wrong_size"
+      },
+      "id": "P247soLr"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "2474a33e32538ef9d6321872"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "lookup_order",
+      "args": {
+        "order_id": "TR-4528"
+      },
+      "id": "AsuWoEBn"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "bf444922a871e5ddfa62e033"
+  }
+}

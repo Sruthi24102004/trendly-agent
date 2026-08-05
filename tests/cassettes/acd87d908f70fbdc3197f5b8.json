@@ -1,0 +1,16 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "search_policy",
+      "args": {
+        "topic": "exchange color colour"
+      },
+      "id": "IXuC4HVn"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "acd87d908f70fbdc3197f5b8"
+  }
+}

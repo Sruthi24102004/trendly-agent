@@ -1,0 +1,8 @@
+{
+  "content": "That order was cancelled before it shipped and the refund has already been processed, so there's nothing to return against it.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "dd06818646c1ce6b71089246"
+  }
+}

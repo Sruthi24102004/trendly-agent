@@ -1,0 +1,16 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "search_policy",
+      "args": {
+        "topic": "lost in transit delayed order"
+      },
+      "id": "rEVhxrTo"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "9affc9e1f4aa0abaa860a6ef"
+  }
+}

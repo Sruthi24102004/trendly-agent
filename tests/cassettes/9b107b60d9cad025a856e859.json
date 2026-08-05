@@ -1,0 +1,16 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "search_policy",
+      "args": {
+        "topic": "refund timeline"
+      },
+      "id": "r3B72Oae"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "9b107b60d9cad025a856e859"
+  }
+}

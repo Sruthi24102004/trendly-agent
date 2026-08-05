@@ -1,0 +1,16 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "apply_delayed_credit",
+      "args": {
+        "order_id": "TR-4525"
+      },
+      "id": "M0QFLp73"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "5b70c277c87948e85ccd4cd6"
+  }
+}

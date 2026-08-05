@@ -1,0 +1,8 @@
+{
+  "content": "I'm not able to offer discounts or coupons, I'm afraid — those aren't something I can create. If an order of yours is delayed or something arrived damaged, tell me and I'll sort out what our policy does cover.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "ed4531354f59df01e8a42f15"
+  }
+}

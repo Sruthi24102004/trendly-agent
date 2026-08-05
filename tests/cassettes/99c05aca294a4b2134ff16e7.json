@@ -1,0 +1,18 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "check_return_eligibility",
+      "args": {
+        "item_id": "TR-EAR-042",
+        "issue_type": "change_of_mind",
+        "order_id": "TR-4527"
+      },
+      "id": "BnAOdqeZ"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "99c05aca294a4b2134ff16e7"
+  }
+}

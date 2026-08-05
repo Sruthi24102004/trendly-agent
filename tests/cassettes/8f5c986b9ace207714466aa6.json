@@ -1,0 +1,8 @@
+{
+  "content": "That's because your order was split into a partial shipment! \n\nThe High-Rise Straight Jeans were sent ahead, which is the one item you received. Your Woven Leather Belt is currently on backorder (expected back in stock around August 9th) and will ship out separately as soon as it's ready, at no extra cost to you.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "8f5c986b9ace207714466aa6"
+  }
+}

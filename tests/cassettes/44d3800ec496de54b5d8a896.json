@@ -1,0 +1,16 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "search_policy",
+      "args": {
+        "topic": "delayed delivery credit"
+      },
+      "id": "wCm6Ccss"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "44d3800ec496de54b5d8a896"
+  }
+}

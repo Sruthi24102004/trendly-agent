@@ -1,0 +1,8 @@
+{
+  "content": "I can see your order TR-4525 for the Court Sneakers is currently delayed—it's past its expected delivery date, and I'm really sorry about that wait. \n\nThe ₹250 delay credit has already been added to your account for this order, which will show at checkout. If you'd like me to look into what's happening with the courier or if there's anything else you need, just let me know!",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "b6c1dfffb3898ae35d1ac635"
+  }
+}

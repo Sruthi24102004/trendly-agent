@@ -1,0 +1,8 @@
+{
+  "content": "Hi! I see your order TR-4528 (the Oxford Shirt) which was delivered on July 19th. How can I help you with it today?",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "fc1f50eb6d8d88b2f563caad"
+  }
+}

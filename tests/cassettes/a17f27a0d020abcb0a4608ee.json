@@ -1,0 +1,8 @@
+{
+  "content": "Could you share your order ID? It usually starts with \"TR-\" and you'll find it in your confirmation email.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "a17f27a0d020abcb0a4608ee"
+  }
+}

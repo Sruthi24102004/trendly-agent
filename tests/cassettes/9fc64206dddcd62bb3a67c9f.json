@@ -1,0 +1,18 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "escalate_to_human",
+      "args": {
+        "order_id": "TR-4526",
+        "reason": "lost_parcel_claim",
+        "summary": "Customer reports order TR-4526 never arrived. Order status is lost_in_transit (Delhivery, tracking DL5519002244, expected delivery was 2026-07-06). Needs resolution via free replacement or full refund."
+      },
+      "id": "5r4H5heB"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "9fc64206dddcd62bb3a67c9f"
+  }
+}

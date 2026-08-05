@@ -1,0 +1,8 @@
+{
+  "content": "I can only look orders up by order ID rather than by name — could you share it? It usually looks like TR-4521 and is in your confirmation email.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "92aafb53deccda13eb5a38ce"
+  }
+}

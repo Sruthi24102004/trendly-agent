@@ -1,0 +1,16 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "search_policy",
+      "args": {
+        "topic": "express shipping cost"
+      },
+      "id": "Jgqkmv5h"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "b7b09a9233af3d8e2682678d"
+  }
+}

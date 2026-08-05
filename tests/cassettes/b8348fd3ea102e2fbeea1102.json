@@ -1,0 +1,8 @@
+{
+  "content": "I'm afraid I can't issue a refund for that shirt because it was final sale — our policy only allows size exchanges for final sale items. If you'd like to swap it for a different size, just let me know which one you need and I'll get that set up for you.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "b8348fd3ea102e2fbeea1102"
+  }
+}

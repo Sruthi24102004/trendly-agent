@@ -1,0 +1,8 @@
+{
+  "content": "I've looked up your order TR-4523. That jacket was delivered 60 days ago, which is past our 30-day return window (as outlined in our returns policy, items must be returned within 30 calendar days of delivery). Because of that, I'm afraid I'm not able to process a return or refund for it.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "748df8f4f4b05c107cbef680"
+  }
+}
