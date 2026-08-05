@@ -175,8 +175,21 @@ def validate_reply(
     }
 
     # 1. Does the reply contradict the eligibility verdict it is reporting?
-    for result in _executed(tool_results, "check_return_eligibility"):
-        outcome = result.get("outcome")
+    #
+    # This is a whole-reply substring search, not per-item — it can't tell
+    # which sentence belongs to which line item. With exactly one
+    # check_return_eligibility result that's unambiguous. With two or more
+    # (a multi-item request with mixed outcomes — e.g. one item eligible,
+    # one genuinely "not eligible"), a correct reply legitimately contains
+    # phrases from *both* CONTRADICTIONS lists at once, and this check can't
+    # tell honest disambiguation from an actual contradiction. Skipping it
+    # for the multi-item case trades missing a real contradiction there
+    # (rare) for not rejecting correct replies (the failure mode this
+    # project's actual bugs came from) — a fixable known limitation, not a
+    # silent gap: see SOLUTION.md.
+    eligibility_results = _executed(tool_results, "check_return_eligibility")
+    if len(eligibility_results) == 1:
+        outcome = eligibility_results[0].get("outcome")
         for phrase in CONTRADICTIONS.get(outcome, []):
             if phrase in lowered:
                 violations.append({

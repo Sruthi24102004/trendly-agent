@@ -59,6 +59,30 @@ def test_legitimate_refusal_passes():
     assert v == []
 
 
+def test_multi_item_mixed_outcome_reply_not_falsely_flagged():
+    """
+    Found while checking multi-item handling (not from a live bug report,
+    unlike the others in this file): a request naming two items with
+    different outcomes produces a correct reply that legitimately contains
+    phrases from *both* CONTRADICTIONS lists at once. The contradiction
+    check is a whole-reply substring search with no per-item attribution, so
+    it can't tell that "not eligible for return" describes the socks, not
+    the tee whose result is eligible_refund. Guards against reintroducing
+    that false positive.
+    """
+    v = validate_reply(
+        "Your Everyday Cotton Tee is eligible for a refund, so I can raise "
+        "that return for you. The Ankle Socks 3-pack, though, is not "
+        "eligible for return since socks fall under our non-returnable "
+        "hygiene category.",
+        [
+            tool("check_return_eligibility", {"outcome": "eligible_refund"}),
+            tool("check_return_eligibility", {"outcome": "not_eligible"}),
+        ],
+    )
+    assert v == []
+
+
 # ----------------------------------------------------- unsupported actions
 
 def test_offering_to_cancel_an_order_is_rejected():
