@@ -27,6 +27,11 @@ from fastapi.testclient import TestClient
 # Frozen clock: without this, TR-4522 leaves the 30-day return window on
 # 13 Aug 2026 and TR-4528 on 18 Aug, silently flipping expected outcomes.
 os.environ.setdefault("TRENDLY_NOW", "2026-08-05T12:00:00Z")
+# Free Gemini tiers cap requests per MINUTE (15 on Flash-Lite). This file fires
+# 23 scenarios back to back, several model calls each, so without pacing the
+# run collapses into 429s and every assertion fails against a "model
+# unavailable" escalation — a false red, exactly as misleading as a false green.
+os.environ.setdefault("MIN_MODEL_INTERVAL_MS", "4500")
 
 from app.main import app  # noqa: E402
 

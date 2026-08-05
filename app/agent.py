@@ -23,7 +23,9 @@ SqliteSaver keyed on session_id.
 
 import json
 import os
+import re
 import sqlite3
+import threading
 import time
 from typing import Annotated, TypedDict
 
@@ -33,8 +35,11 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
+from app.cassettes import CassetteLLM
+from app.observability import log_turn
 from app.prompts import SYSTEM_PROMPT
 from app.tools import ALL_TOOLS, _find_order
+from app.validation import correction_prompt, validate_reply
 
 load_dotenv()
 
@@ -49,15 +54,64 @@ load_dotenv()
 PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 
 _DEFAULTS = {
-    "gemini": ("gemini-3.6-flash", "gemini-3.5-flash-lite"),
+    # Flash-Lite is the primary: this workload is routing plus tool selection
+    # over a one-page policy, which is squarely what it is built for, and its
+    # free-tier limits are far higher than 3.6 Flash's 20 requests/day. 3.6
+    # Flash sits behind it for anything Lite can't handle.
+    #
+    # The GA model strings are pinned rather than the "-latest" aliases: those
+    # hot-swap and may point at a preview or experimental release, which is not
+    # what you want behind a live URL. Override via PRIMARY_MODEL if you do
+    # want auto-updating (e.g. gemini-flash-lite-latest).
+    "gemini": ("gemini-3.5-flash-lite", "gemini-3.6-flash"),
     "groq": ("llama-3.3-70b-versatile", "llama-3.1-8b-instant"),
 }
+
+# Flash-Lite defaults to thinking_level "minimal", which Google explicitly
+# warns causes premature tool termination in agentic workflows — precisely the
+# failure where the model answers without calling check_return_eligibility.
+THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "medium")
+
+# Free tiers cap requests per MINUTE (15/min on Flash-Lite), not per day, so a
+# burst fails while the quota is nearly untouched. A minimum spacing between
+# model calls converts a wall of 429s into a slightly slower run. Off by
+# default (0); scripts that fire many turns back to back set it.
+MIN_CALL_INTERVAL_MS = int(os.environ.get("MIN_MODEL_INTERVAL_MS", "0"))
+_last_call_at = 0.0
+_call_lock = threading.Lock()
+
+
+def _throttle() -> None:
+    global _last_call_at
+    if MIN_CALL_INTERVAL_MS <= 0:
+        return
+    with _call_lock:
+        wait = (_last_call_at + MIN_CALL_INTERVAL_MS / 1000) - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_at = time.monotonic()
+
+
+def _suggested_retry_seconds(error: Exception) -> float | None:
+    """
+    Providers tell us how long to wait — Gemini in a retryDelay field, Groq in
+    the message text. Honouring it beats a fixed backoff, which either stalls
+    too long or retries far too early.
+    """
+    text = str(error)
+    for pattern in (r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'",
+                    r"retry in (\d+(?:\.\d+)?)\s*s"):
+        match = re.search(pattern, text)
+        if match:
+            return float(match.group(1))
+    return None
 _default_primary, _default_fallback = _DEFAULTS.get(PROVIDER, _DEFAULTS["gemini"])
 
 PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", _default_primary)
 FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", _default_fallback)
 MODEL = PRIMARY_MODEL  # reported by /health
 MAX_ITERATIONS = 6
+MAX_RETRY_WAIT_S = float(os.environ.get("MAX_RETRY_WAIT_S", "12"))
 DB_PATH = os.environ.get("SESSIONS_DB", "sessions.db")
 
 
@@ -77,9 +131,15 @@ def _build_llm(model_name: str):
             raise RuntimeError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in .env")
         # temperature/top_p/top_k are deprecated on Gemini 3.x — omitted rather
         # than passed, so the model uses its own defaults.
-        return ChatGoogleGenerativeAI(
-            model=model_name, api_key=api_key, max_retries=0
-        ).bind_tools(ALL_TOOLS)
+        kwargs = {"model": model_name, "api_key": api_key, "max_retries": 0}
+        try:
+            client = ChatGoogleGenerativeAI(thinking_level=THINKING_LEVEL, **kwargs)
+        except TypeError:
+            # Older langchain-google-genai doesn't expose thinking_level. Fall
+            # back rather than hard-fail; behaviour degrades, nothing breaks.
+            print("[agent] thinking_level unsupported by this SDK version — omitting")
+            client = ChatGoogleGenerativeAI(**kwargs)
+        return CassetteLLM(client.bind_tools(ALL_TOOLS), model_name)
 
     if PROVIDER == "groq":
         from langchain_groq import ChatGroq
@@ -87,9 +147,12 @@ def _build_llm(model_name: str):
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             raise RuntimeError("Set GROQ_API_KEY in .env")
-        return ChatGroq(
-            model=model_name, api_key=api_key, temperature=0.1, max_retries=0
-        ).bind_tools(ALL_TOOLS)
+        return CassetteLLM(
+            ChatGroq(
+                model=model_name, api_key=api_key, temperature=0.1, max_retries=0
+            ).bind_tools(ALL_TOOLS),
+            model_name,
+        )
 
     raise RuntimeError(f"Unknown LLM_PROVIDER {PROVIDER!r} — use 'gemini' or 'groq'")
 
@@ -97,10 +160,31 @@ def _build_llm(model_name: str):
 primary_llm = _build_llm(PRIMARY_MODEL)
 fallback_llm = _build_llm(FALLBACK_MODEL)
 
+
+def configure_models(provider: str, primary: str, fallback: str) -> None:
+    """
+    Rebuild the models at runtime. agent_node resolves these as module globals
+    on every call, so reassigning them swaps the provider without touching the
+    compiled graph. Used by scripts/ab_compare.py to run the same scenarios
+    across providers in one process.
+    """
+    global PROVIDER, PRIMARY_MODEL, FALLBACK_MODEL, MODEL, primary_llm, fallback_llm
+    PROVIDER = provider.strip().lower()
+    PRIMARY_MODEL, FALLBACK_MODEL, MODEL = primary, fallback, primary
+    primary_llm = _build_llm(primary)
+    fallback_llm = _build_llm(fallback)
+
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
 # Outcomes from check_return_eligibility that permit initiate_return, mapped
 # to the resolutions each one allows.
+# Tools whose results ground a factual claim. Once one has run, later turns in
+# the same conversation may refer back to what it established.
+GROUNDING_TOOL_NAMES = {
+    "search_policy", "lookup_order", "check_return_eligibility",
+    "apply_delayed_credit", "initiate_return",
+}
+
 ALLOWED_RESOLUTIONS = {
     "eligible_refund": {"refund", "exchange"},
     "exchange_only": {"exchange"},
@@ -110,12 +194,18 @@ ALLOWED_RESOLUTIONS = {
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     session_customer_id: str | None       # persists — binds session to a customer
+    session_grounded: bool                # persists — a grounding tool has run
     looked_up_orders: list[str]           # persists — order_ids seen via lookup_order
     eligibility_outcomes: dict            # persists — "order|item" -> outcome
     consecutive_failures: int             # per turn
     last_failed_tool: str | None          # per turn
     escalated: bool                       # per turn
     iteration: int                        # per turn
+    validation_retries: int               # per turn
+    last_violations: list                 # per turn — surfaced in diagnostics
+    model_used: str | None                # per turn — which model answered
+    fallback_used: bool                   # per turn
+    escalation_reason: str | None         # per turn — why a human was needed
 
 
 def _safe_json(text):
@@ -176,14 +266,32 @@ def agent_node(state: AgentState) -> dict:
     ):
         for attempt in range(3 if model is primary_llm else 2):
             try:
+                _throttle()
                 response = model.invoke(messages)
-                if model is not primary_llm:
+                is_fallback = model is not primary_llm
+                if is_fallback:
                     print(f"[agent_node] answered using fallback model {model_name}")
-                return {"messages": [response], "iteration": iteration}
+                return {
+                    "messages": [response],
+                    "iteration": iteration,
+                    "model_used": model_name,
+                    "fallback_used": is_fallback,
+                }
             except Exception as e:
                 last_error = e
-                print(f"[agent_node] {model_name} attempt {attempt + 1} failed: {e!r}")
-                time.sleep(2 ** attempt)
+                # Rate-limit errors carry a full JSON blob; one line is enough.
+                brief = str(e).split("\n")[0][:160]
+                print(f"[agent_node] {model_name} attempt {attempt + 1} failed: {brief}")
+
+                suggested = _suggested_retry_seconds(e)
+                if suggested is not None and suggested <= MAX_RETRY_WAIT_S:
+                    time.sleep(suggested + 0.3)
+                elif suggested is not None:
+                    # Waiting a minute mid-conversation is worse than trying
+                    # the other model, which has a separate quota.
+                    break
+                else:
+                    time.sleep(2 ** attempt)
 
     escalation = TOOL_MAP["escalate_to_human"].invoke({
         "summary": (
@@ -197,6 +305,7 @@ def agent_node(state: AgentState) -> dict:
     return {
         "messages": [AIMessage(content=escalation["customer_message"])],
         "escalated": True,
+        "escalation_reason": "model_unavailable",
         "iteration": iteration,
     }
 
@@ -208,11 +317,13 @@ def tool_node(state: AgentState) -> dict:
     tool_calls = getattr(last_message, "tool_calls", None) or []
 
     session_customer_id = state.get("session_customer_id")
+    session_grounded = bool(state.get("session_grounded"))
     looked_up_orders = set(state.get("looked_up_orders") or [])
     eligibility_outcomes = dict(state.get("eligibility_outcomes") or {})
     consecutive_failures = state.get("consecutive_failures", 0)
     last_failed_tool = state.get("last_failed_tool")
     escalated = state.get("escalated", False)
+    escalation_reason = state.get("escalation_reason")
 
     tool_messages = []
 
@@ -305,6 +416,8 @@ def tool_node(state: AgentState) -> dict:
                 try:
                     result = tool_obj.invoke(args)
                     consecutive_failures = 0
+                    if tool_name in GROUNDING_TOOL_NAMES:
+                        session_grounded = True
 
                     if tool_name == "lookup_order" and result.get("found"):
                         order_id = args.get("order_id", "").strip().upper()
@@ -343,11 +456,13 @@ def tool_node(state: AgentState) -> dict:
     return {
         "messages": tool_messages,
         "session_customer_id": session_customer_id,
+        "session_grounded": session_grounded,
         "looked_up_orders": sorted(looked_up_orders),
         "eligibility_outcomes": eligibility_outcomes,
         "consecutive_failures": consecutive_failures,
         "last_failed_tool": last_failed_tool,
         "escalated": escalated,
+        "escalation_reason": escalation_reason,
     }
 
 
@@ -375,13 +490,98 @@ def force_escalate_node(state: AgentState) -> dict:
     return {
         "messages": [AIMessage(content=escalation["customer_message"])],
         "escalated": True,
+        "escalation_reason": reason,
+    }
+
+
+def _turn_tool_results(messages) -> list[dict]:
+    """Tool results produced since the customer's most recent message."""
+    turn: list[dict] = []
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            # The validator's corrective message is a HumanMessage so that
+            # every provider accepts it mid-conversation, but it is not the
+            # customer speaking — skip it, or a redraft would see no tools.
+            if (m.additional_kwargs or {}).get("validation_correction"):
+                continue
+            break
+        if isinstance(m, ToolMessage):
+            turn.append({"tool": m.name, "result": _safe_json(_as_text(m.content))})
+    return list(reversed(turn))
+
+
+# ---------- NODE: validate (checks the drafted reply before it is sent) ----------
+
+def validate_node(state: AgentState) -> dict:
+    """
+    The guardrails in tool_node constrain what the agent may DO. This
+    constrains what it may SAY. Every wrong answer this project produced came
+    from the model describing a correct tool verdict incorrectly, so the reply
+    is checked against the turn's tool results before the customer sees it.
+    """
+    messages = state["messages"]
+    reply = _as_text(messages[-1].content)
+    tool_results = _turn_tool_results(messages)
+
+    violations = validate_reply(
+        reply,
+        tool_results,
+        state.get("session_customer_id"),
+        session_grounded=bool(state.get("session_grounded")),
+    )
+    if not violations:
+        return {"last_violations": []}
+
+    retries = state.get("validation_retries", 0)
+    codes = [v["code"] for v in violations]
+    print(f"[validate_node] rejected reply (attempt {retries + 1}): {codes}")
+
+    if retries >= 1:
+        # One corrective attempt already failed. Escalating beats sending a
+        # reply we know to be wrong.
+        escalation = TOOL_MAP["escalate_to_human"].invoke({
+            "summary": (
+                "The assistant drafted a reply that failed automated "
+                f"validation twice ({', '.join(codes)}). The customer's "
+                "request is in the transcript and has NOT been actioned."
+            ),
+            "reason": "reply_validation_failed",
+        })
+        return {
+            "messages": [AIMessage(content=escalation["customer_message"])],
+            "escalated": True,
+            "escalation_reason": "reply_validation_failed",
+            "last_violations": violations,
+            "validation_retries": retries + 1,
+        }
+
+    return {
+        "messages": [
+            HumanMessage(
+                content=correction_prompt(violations),
+                additional_kwargs={"validation_correction": True},
+            )
+        ],
+        "validation_retries": retries + 1,
+        "last_violations": violations,
     }
 
 
 # ---------- ROUTING ----------
 
 def route_after_agent(state: AgentState) -> str:
-    return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
+    if getattr(state["messages"][-1], "tool_calls", None):
+        return "tools"
+    return "validate"
+
+
+def route_after_validation(state: AgentState) -> str:
+    """Clean reply -> done. Rejected once -> redraft. Rejected twice -> escalate."""
+    if not state.get("last_violations"):
+        return END
+    if state.get("escalated"):
+        return END
+    return "agent"
 
 
 def route_after_tools(state: AgentState) -> str:
@@ -398,9 +598,15 @@ graph_builder = StateGraph(AgentState)
 graph_builder.add_node("agent", agent_node)
 graph_builder.add_node("tools", tool_node)
 graph_builder.add_node("force_escalate", force_escalate_node)
+graph_builder.add_node("validate", validate_node)
 
 graph_builder.set_entry_point("agent")
-graph_builder.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
+graph_builder.add_conditional_edges(
+    "agent", route_after_agent, {"tools": "tools", "validate": "validate"}
+)
+graph_builder.add_conditional_edges(
+    "validate", route_after_validation, {"agent": "agent", END: END}
+)
 graph_builder.add_conditional_edges(
     "tools", route_after_tools, {"agent": "agent", "force_escalate": "force_escalate"}
 )
@@ -415,6 +621,7 @@ graph = graph_builder.compile(checkpointer=checkpointer)
 
 def run_agent(session_id: str, user_message: str) -> dict:
     config = {"configurable": {"thread_id": session_id}}
+    started = time.perf_counter()
 
     prior_state = graph.get_state(config)
     prior_count = len(prior_state.values.get("messages", [])) if prior_state.values else 0
@@ -429,6 +636,11 @@ def run_agent(session_id: str, user_message: str) -> dict:
             "consecutive_failures": 0,
             "last_failed_tool": None,
             "escalated": False,
+            "escalation_reason": None,
+            "validation_retries": 0,
+            "last_violations": [],
+            "model_used": None,
+            "fallback_used": False,
         },
         config=config,
     )
@@ -440,8 +652,57 @@ def run_agent(session_id: str, user_message: str) -> dict:
         if isinstance(m, ToolMessage)
     ]
 
+    reply = _as_text(result["messages"][-1].content)
+    latency_ms = round((time.perf_counter() - started) * 1000, 1)
+
+    blocked_calls = sum(
+        1 for c in tool_calls_made
+        if isinstance(c["result"], dict) and c["result"].get("blocked")
+    )
+    outcomes = [
+        c["result"]["outcome"] for c in tool_calls_made
+        if isinstance(c["result"], dict) and c["result"].get("outcome")
+    ]
+    violations = [v["code"] for v in (result.get("last_violations") or [])]
+
+    # Everything the graph is holding for this conversation. Surfaced so the
+    # UI can show multi-turn state directly rather than asserting it exists.
+    state = {
+        "session_customer_id": result.get("session_customer_id"),
+        "looked_up_orders": result.get("looked_up_orders") or [],
+        "eligibility_outcomes": result.get("eligibility_outcomes") or {},
+        "iterations_this_turn": result.get("iteration", 0),
+        "validation_retries": result.get("validation_retries", 0),
+    }
+    diagnostics = {
+        "model_used": result.get("model_used"),
+        "fallback_used": bool(result.get("fallback_used")),
+        "latency_ms": latency_ms,
+        "blocked_calls": blocked_calls,
+        "validation_violations": violations,
+        "escalation_reason": result.get("escalation_reason"),
+    }
+
+    log_turn({
+        "session_id": session_id,
+        "provider": PROVIDER,
+        "model_used": result.get("model_used"),
+        "fallback_used": bool(result.get("fallback_used")),
+        "tools": [c["tool"] for c in tool_calls_made],
+        "outcomes": outcomes,
+        "blocked_calls": blocked_calls,
+        "validation_violations": violations,
+        "validation_retries": result.get("validation_retries", 0),
+        "escalated": bool(result.get("escalated")),
+        "escalation_reason": result.get("escalation_reason"),
+        "latency_ms": latency_ms,
+        "reply_chars": len(reply),
+    })
+
     return {
-        "reply": _as_text(result["messages"][-1].content),
+        "reply": reply,
         "tool_calls_made": tool_calls_made,
-        "escalated": result.get("escalated", False),
+        "escalated": bool(result.get("escalated", False)),
+        "state": state,
+        "diagnostics": diagnostics,
     }

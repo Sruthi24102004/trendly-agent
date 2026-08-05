@@ -3,3 +3,6 @@
 sessions.db
 __pycache__/
 *.pyc
+.pytest_cache/
+logs/
+ab_results.json
