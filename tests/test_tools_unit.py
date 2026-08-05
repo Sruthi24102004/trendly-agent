@@ -126,10 +126,18 @@ def test_ambiguous_item_reference_asks_instead_of_guessing():
         ("TR-4527", "the earrings", "TR-EAR-042"),
         ("TR-4530", "my kurta", "TR-KRT-033"),
         ("TR-4530", "TR-KRT-033", "TR-KRT-033"),
+        # Sole-item fallback: no product word at all, and only one line item
+        # on the order, so there is nothing to disambiguate. The model passing
+        # the order ID or a positional label used to deadlock the conversation
+        # with "which of these did you mean?" on a one-item order.
+        ("TR-4527", "TR-4527", "TR-EAR-042"),  # model passed the order ID
+        ("TR-4527", "item_1", "TR-EAR-042"),   # positional label
+        ("TR-4530", "", "TR-KRT-033"),         # empty reference
         # Refuses: names a product that isn't on this order, or is ambiguous
         ("TR-4524", "leather jacket", None),   # shares "leather" with the belt
         ("TR-4524", "jeans belt", None),       # could be either line item
-        ("TR-4530", "a jacket", None),         # no jacket on this order
+        ("TR-4530", "a jacket", None),         # contradiction, not absence
+        ("TR-4524", "item_1", None),           # no signal, but 2 items -> ask
         ("TR-4522", "that thing", None),       # no product word at all
     ],
 )

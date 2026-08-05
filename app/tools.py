@@ -103,21 +103,19 @@ def _find_item(order: dict, item_id: str) -> tuple[dict | None, str]:
     the wrong product. It is deliberately gone: when we can't resolve the
     reference confidently we say so and let the agent ask.
     """
-    if not item_id:
-        return None, "none"
+    needle = (item_id or "").strip().lower()
 
-    needle = item_id.strip().lower()
+    if needle:
+        for item in order["items"]:
+            if item["sku"].lower() == needle:
+                return item, "exact"
 
-    for item in order["items"]:
-        if item["sku"].lower() == needle:
-            return item, "exact"
-
-    # Whole-phrase containment in either direction, e.g. "socks" -> "Ankle
-    # Socks 3-pack", or "Block-Print Kurta (large)" -> "Block-Print Kurta".
-    for item in order["items"]:
-        name = item["name"].lower()
-        if needle in name or name in needle:
-            return item, "name"
+        # Whole-phrase containment in either direction, e.g. "socks" -> "Ankle
+        # Socks 3-pack", or "Block-Print Kurta (large)" -> "Block-Print Kurta".
+        for item in order["items"]:
+            name = item["name"].lower()
+            if needle in name or name in needle:
+                return item, "name"
 
     # Plain-language reference ("the belt please", "my kurta"). Words are
     # scored against the catalogue vocabulary so that filler ("the", "please")
@@ -127,7 +125,16 @@ def _find_item(order: dict, item_id: str) -> tuple[dict | None, str]:
     # catalogue word that this item doesn't have, so the match is rejected.
     query = {_stem(w) for w in re.findall(r"[a-z]+", needle) if len(w) > 2}
     meaningful = query & _catalogue_vocabulary()
+
     if not meaningful:
+        # The reference names no product at all — the model passed the order
+        # ID, a positional label ("item_1"), or an empty string. If the order
+        # has exactly one line item there is nothing to disambiguate, so
+        # resolve to it rather than asking "which of these did you mean?" of
+        # an order with one item. That question is nonsense to a customer and
+        # it deadlocks the conversation.
+        if len(order["items"]) == 1:
+            return order["items"][0], "sole_item"
         return None, "none"
 
     matches = [
@@ -137,6 +144,9 @@ def _find_item(order: dict, item_id: str) -> tuple[dict | None, str]:
     if len(matches) == 1:
         return matches[0], "name"
 
+    # A real product word that doesn't match anything on this order ("a jacket"
+    # on a kurta order) is a contradiction, not a missing reference — ask,
+    # even if the order has only one item.
     return None, "none"
 
 
