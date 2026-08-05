@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from app.agent import MODEL, run_agent
+from app.agent import MODEL, PROVIDER, run_agent
 
 app = FastAPI(title="Trendly Support Agent")
 
@@ -30,6 +30,7 @@ def health():
     """Cheap liveness probe — no model call, safe for uptime pings."""
     return {
         "status": "ok",
+        "provider": PROVIDER,
         "model": MODEL,
         "clock_override": os.environ.get("TRENDLY_NOW"),
     }

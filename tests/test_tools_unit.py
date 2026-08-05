@@ -177,6 +177,19 @@ def test_delayed_credit_issued_once():
     assert second["outcome"] == "already_issued", "credit must be idempotent"
 
 
+def test_delayed_credit_refused_on_lost_parcel():
+    """
+    Regression: a lost parcel is 30 days past its estimate, so the delay-credit
+    arithmetic says "eligible". Policy 1.6 says it is a claim for a human, not
+    a delay. The tool issued the credit anyway and the model then offered to
+    cancel the order for a refund — an action it has no tool for.
+    """
+    result = apply_delayed_credit.invoke({"order_id": "TR-4526"})
+    assert result["outcome"] == "escalate"
+    assert result["reason_code"] == "lost_parcel_claim"
+    assert "credit_amount" not in result
+
+
 def test_delayed_credit_not_offered_on_delivered_order():
     result = apply_delayed_credit.invoke({"order_id": "TR-4530"})
     assert result["outcome"] == "not_eligible"

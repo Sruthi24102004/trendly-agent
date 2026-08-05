@@ -29,7 +29,6 @@ from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_groq import ChatGroq
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -39,19 +38,64 @@ from app.tools import ALL_TOOLS, _find_order
 
 load_dotenv()
 
-# llama-3.1-8b-instant does not follow this prompt reliably: it paraphrases
-# tool verdicts into their opposite and ignores the data-disclosure rules.
-# 70b-versatile is the default; 8b stays as a fallback for when the 70b daily
-# token cap is hit, since a degraded answer beats no answer.
-PRIMARY_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
+# ---------- Model configuration ----------
+# The graph is provider-agnostic: it only needs something that implements
+# .bind_tools() and .invoke(). Swapping providers is a config change, not a
+# code change, which also makes it cheap to fall back when one is rate-limited.
+#
+# Defaults are Gemini 3.6 Flash (better tool-calling reliability and ~17%
+# fewer output tokens than the previous Flash generation) with 3.5 Flash-Lite
+# as the cheap fallback. Set LLM_PROVIDER=groq to switch back.
+PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
+
+_DEFAULTS = {
+    "gemini": ("gemini-3.6-flash", "gemini-3.5-flash-lite"),
+    "groq": ("llama-3.3-70b-versatile", "llama-3.1-8b-instant"),
+}
+_default_primary, _default_fallback = _DEFAULTS.get(PROVIDER, _DEFAULTS["gemini"])
+
+PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", _default_primary)
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", _default_fallback)
 MODEL = PRIMARY_MODEL  # reported by /health
 MAX_ITERATIONS = 6
 DB_PATH = os.environ.get("SESSIONS_DB", "sessions.db")
 
-_api_key = os.environ["GROQ_API_KEY"]
-primary_llm = ChatGroq(model=PRIMARY_MODEL, api_key=_api_key, temperature=0.1).bind_tools(ALL_TOOLS)
-fallback_llm = ChatGroq(model=FALLBACK_MODEL, api_key=_api_key, temperature=0.1).bind_tools(ALL_TOOLS)
+
+def _build_llm(model_name: str):
+    """
+    Construct a tool-bound chat model for the configured provider.
+
+    max_retries=0 is deliberate: the SDKs retry internally by default, which
+    silently multiplies against agent_node's own retry loop and turns a
+    rate-limit into a very long stall. Retry policy lives in one place.
+    """
+    if PROVIDER == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in .env")
+        # temperature/top_p/top_k are deprecated on Gemini 3.x — omitted rather
+        # than passed, so the model uses its own defaults.
+        return ChatGoogleGenerativeAI(
+            model=model_name, api_key=api_key, max_retries=0
+        ).bind_tools(ALL_TOOLS)
+
+    if PROVIDER == "groq":
+        from langchain_groq import ChatGroq
+
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set GROQ_API_KEY in .env")
+        return ChatGroq(
+            model=model_name, api_key=api_key, temperature=0.1, max_retries=0
+        ).bind_tools(ALL_TOOLS)
+
+    raise RuntimeError(f"Unknown LLM_PROVIDER {PROVIDER!r} — use 'gemini' or 'groq'")
+
+
+primary_llm = _build_llm(PRIMARY_MODEL)
+fallback_llm = _build_llm(FALLBACK_MODEL)
 
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
@@ -79,6 +123,29 @@ def _safe_json(text):
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
         return text
+
+
+def _as_text(content) -> str:
+    """
+    Flatten a message's content to a plain string.
+
+    Providers differ here: Groq returns a string, while Gemini returns a list
+    of content blocks — [{"type": "text", "text": ..., "extras": {...}}] —
+    carrying thought signatures alongside the visible text. The API contract
+    is a string, so the difference is normalised at the boundary rather than
+    leaking the provider's shape into the response model.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(p for p in parts if p).strip()
+    return str(content) if content is not None else ""
 
 
 def _blocked(message: str, **extra) -> dict:
@@ -175,13 +242,34 @@ def tool_node(state: AgentState) -> dict:
                     ),
                 )
 
-        # --- Guardrail 1: lookup before eligibility ---
+        # --- Guardrail 1: the order must be established before eligibility ---
+        # Originally this bounced the call back with "call lookup_order first".
+        # That relies on the model reading a correction and retrying, which it
+        # frequently doesn't — it retried the same blocked call and then
+        # escalated. The precondition is mechanically satisfiable: the graph
+        # has the order ID, so it resolves the order itself and proceeds. The
+        # safety property the guardrail existed for (no invented item_ids) is
+        # now enforced where it belongs, in _find_item, which returns the real
+        # line items instead of guessing.
         if result is None and tool_name == "check_return_eligibility":
-            if args.get("order_id", "").strip().upper() not in looked_up_orders:
-                result = _blocked(
-                    "call lookup_order for this exact order_id first, so you "
-                    "use the order's real item_id (SKU). Do not guess one."
-                )
+            order_key = args.get("order_id", "").strip().upper()
+            if order_key not in looked_up_orders:
+                order = _find_order(order_key)
+                if order is None:
+                    pass  # let the tool return its own order_not_found verdict
+                elif session_customer_id and order["customer_id"] != session_customer_id:
+                    result = _blocked(
+                        "this order belongs to a different customer than the "
+                        "one in this conversation.",
+                        customer_message=(
+                            "I can only help with orders placed on your own "
+                            "account, so I can't check that one."
+                        ),
+                    )
+                else:
+                    looked_up_orders.add(order_key)
+                    if session_customer_id is None:
+                        session_customer_id = order["customer_id"]
 
         # --- Guardrail 2: eligibility before action, and matching resolution ---
         if result is None and tool_name == "initiate_return":
@@ -347,13 +435,13 @@ def run_agent(session_id: str, user_message: str) -> dict:
 
     new_messages = result["messages"][prior_count:]
     tool_calls_made = [
-        {"tool": m.name, "result": _safe_json(m.content)}
+        {"tool": m.name, "result": _safe_json(_as_text(m.content))}
         for m in new_messages
         if isinstance(m, ToolMessage)
     ]
 
     return {
-        "reply": result["messages"][-1].content,
+        "reply": _as_text(result["messages"][-1].content),
         "tool_calls_made": tool_calls_made,
         "escalated": result.get("escalated", False),
     }

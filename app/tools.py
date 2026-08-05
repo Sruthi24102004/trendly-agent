@@ -405,7 +405,7 @@ def initiate_return(
     item_id: str,
     resolution: str,
     reason: str,
-    new_size: str | None = None,
+    new_size: str = "",
 ) -> dict:
     """Create the return or exchange. Only call this after
     check_return_eligibility returned outcome 'eligible_refund' or
@@ -492,6 +492,19 @@ def apply_delayed_credit(order_id: str) -> dict:
             f"I couldn't find an order with the ID {order_id}.",
         )
 
+    # Lost parcels are a claim, not a delay (policy 1.6). Without this the
+    # tool happily issued a ₹250 credit on a lost order and the model then
+    # offered to cancel it for a refund — an action it has no tool for and no
+    # authority to promise. The status check belongs here, not in the prompt.
+    if order["status"] == "lost_in_transit":
+        return _verdict(
+            "escalate", "lost_parcel_claim",
+            "The carrier has marked this parcel as lost, which we handle as a "
+            "lost-parcel claim rather than a delay. A colleague will pick this "
+            "up and sort out a free replacement or a full refund — whichever "
+            "you'd prefer — within 5 business days.",
+        )
+
     if order["status"] in ("delivered", "cancelled"):
         return _verdict(
             "not_eligible", "not_in_transit",
@@ -542,7 +555,7 @@ def apply_delayed_credit(order_id: str) -> dict:
 # ---------- TOOL 6: escalate_to_human ----------
 
 @tool
-def escalate_to_human(summary: str, reason: str, order_id: str | None = None) -> dict:
+def escalate_to_human(summary: str, reason: str, order_id: str = "") -> dict:
     """Hand off to a human agent. Use when the request is outside what you can
     do (lost parcels, damaged-item photos, discounts, bank details, disputes),
     when a tool fails repeatedly, or when the policy doesn't cover the
