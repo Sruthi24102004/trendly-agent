@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Deterministic, offline, no secrets required. This is the fast signal —
+  # covers the decision logic (test_tools_unit.py) and the reply validator
+  # (test_guardrails_unit.py) in well under a second.
+  unit-and-guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: pytest -m "not llm" -v
+
+  # Scripted conversations against the real agent graph, replayed from
+  # tests/cassettes/*.json rather than hitting a live model — deterministic,
+  # free, and runnable without a Groq API key. Record cassettes locally with
+  # `CASSETTE_MODE=record pytest -m llm` and commit them for this job to
+  # exercise anything; until then it's a no-op guard rather than a false red.
+  scenarios-replay:
+    runs-on: ubuntu-latest
+    needs: unit-and-guardrails
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run scenario suite from recorded cassettes
+        env:
+          CASSETTE_MODE: replay
+          TRENDLY_NOW: "2026-08-05T12:00:00Z"
+        run: |
+          if [ -z "$(ls -A tests/cassettes/*.json 2>/dev/null)" ]; then
+            echo "No cassettes committed yet under tests/cassettes/ — skipping."
+            echo "Record with: CASSETTE_MODE=record pytest -m llm"
+            exit 0
+          fi
+          pytest -m llm -v

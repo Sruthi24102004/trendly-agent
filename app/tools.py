@@ -43,6 +43,14 @@ ISSUE_TYPES_DAMAGE = {"damaged", "defective", "wrong_item"}
 # noted as a limitation in SOLUTION.md.
 _ISSUED_DELAY_CREDITS: set[str] = set()
 
+# Same idea for returns/exchanges: without this, a customer who says "return
+# it" twice in one session (or a model that re-calls the tool after a
+# mis-parsed confirmation) raises two return_ids for the same item, and a
+# human ends up reconciling two reverse pickups against one product. Keyed
+# on (order_id, sku) rather than the generated return_id since the whole
+# point is catching the call *before* a second ID is minted.
+_OPEN_RETURNS: dict[tuple[str, str], str] = {}
+
 
 def _now() -> datetime:
     """
@@ -424,6 +432,21 @@ def initiate_return(
 
     resolution = (resolution or "refund").strip().lower()
 
+    open_key = (order["order_id"], item["sku"])
+    existing_return_id = _OPEN_RETURNS.get(open_key)
+    if existing_return_id:
+        return {
+            "success": False,
+            "error": "already_initiated",
+            "return_id": existing_return_id,
+            "customer_message": (
+                f"I've already raised this for your {item['name']} — the "
+                f"reference is {existing_return_id}, so there's no need to "
+                "start it again. Let me know if you'd like a status update "
+                "on that instead."
+            ),
+        }
+
     if resolution == "exchange":
         if not new_size:
             return {
@@ -431,9 +454,11 @@ def initiate_return(
                 "error": "missing_size",
                 "customer_message": "Which size would you like instead?",
             }
+        exc_id = f"EXC-{order['order_id']}-{item['sku']}"
+        _OPEN_RETURNS[open_key] = exc_id
         return {
             "success": True,
-            "return_id": f"EXC-{order['order_id']}-{item['sku']}",
+            "return_id": exc_id,
             "type": "size_exchange",
             "item": item["name"],
             "new_size": new_size,
@@ -454,9 +479,11 @@ def initiate_return(
     }
     timeline = timelines.get(payment_method, "per the timelines in our refund policy")
 
+    ret_id = f"RET-{order['order_id']}-{item['sku']}"
+    _OPEN_RETURNS[open_key] = ret_id
     result = {
         "success": True,
-        "return_id": f"RET-{order['order_id']}-{item['sku']}",
+        "return_id": ret_id,
         "type": "refund_return",
         "item": item["name"],
         "customer_message": (

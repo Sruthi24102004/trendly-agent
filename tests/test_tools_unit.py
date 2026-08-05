@@ -224,6 +224,41 @@ def test_uncovered_topic_still_returns_not_found():
     assert "NOT FOUND" in text
 
 
+@pytest.mark.parametrize(
+    "topic,must_contain",
+    [
+        # None of these phrasings appear verbatim in EXPANSIONS — they're
+        # paraphrases a real customer would actually type, not the keywords
+        # the retriever was hand-tuned against. Covers the retrieval-quality
+        # risk flagged in policy_store.py's own docstring: word-level +
+        # synonym-map matching, not embeddings.
+        ("will I get my money back to my wallet", "Refunds"),
+        ("is it free to send something back", "Shipping"),
+        ("do returned items need the original packaging", "Returns"),
+        ("can I get store credit instead of a refund", "Refunds"),
+        ("how do I get a different size sent to me", "Exchanges"),
+    ],
+)
+def test_policy_search_handles_customer_phrasing_not_in_expansions(topic, must_contain):
+    text = search_policy.invoke({"topic": topic})["policy_text"]
+    assert must_contain in text, f"{topic!r} -> {text[:80]!r}"
+
+
+def test_ambiguous_delivery_failure_fails_safe_not_wrong_section():
+    """
+    'Courier never showed up' scores just under MIN_SCORE against every
+    section (2 vs. threshold 3) — close enough to 1.6 Lost parcels that a
+    looser threshold could easily mis-route it there, telling a customer
+    their non-delivery is being handled as a lost-parcel claim when the doc
+    doesn't actually say that. Escalating to NOT FOUND (-> human, per the
+    system prompt) is the correct fail-safe here, not a retrieval miss to fix.
+    """
+    text = search_policy.invoke(
+        {"topic": "what happens if the courier never shows up"}
+    )["policy_text"]
+    assert "NOT FOUND" in text
+
+
 # ---------------------------------------------------------------- escalation
 
 def test_escalation_carries_actionable_context():
@@ -265,3 +300,25 @@ def test_refund_message_matches_payment_method():
     })
     assert "bank transfer" in cod["customer_message"]
     assert "agent_note" in cod  # never collect bank details in chat
+
+
+def test_initiate_return_is_idempotent():
+    """
+    Nothing stopped a second initiate_return call on the same order+item from
+    minting a second return_id — a real duplicate reverse pickup, not just a
+    confusing reply. Uses TR-4530/TR-KRT-033, untouched by other tests in this
+    file, so this doesn't depend on test execution order.
+    """
+    first = initiate_return.invoke({
+        "order_id": "TR-4530", "item_id": "TR-KRT-033",
+        "resolution": "refund", "reason": "changed my mind",
+    })
+    assert first["success"] is True
+
+    second = initiate_return.invoke({
+        "order_id": "TR-4530", "item_id": "TR-KRT-033",
+        "resolution": "refund", "reason": "changed my mind",
+    })
+    assert second["success"] is False
+    assert second["error"] == "already_initiated"
+    assert second["return_id"] == first["return_id"]
