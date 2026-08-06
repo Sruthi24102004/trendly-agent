@@ -188,8 +188,14 @@ def chat(req: ChatRequest):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return CHAT_PAGE
+def index(request: Request):
+    """
+    The customer page. It carries no operator content, but it accepts ?token=
+    so an evaluator can enable the account switcher without first visiting an
+    operator page — the switcher is fed by /demo/contacts, which is gated.
+    Without a token this is exactly the page a customer sees.
+    """
+    return _admin_page(request, CHAT_PAGE)
 
 
 @app.get("/dashboard", response_class=HTMLResponse,
@@ -421,8 +427,8 @@ let contacts = [];
 async function loadSwitcher() {
   const bar = document.getElementById("switcher");
   try {
-    const res = await fetch("/demo/contacts");
-    if (!res.ok) return;
+    const res = await fetch("/demo/contacts", { credentials: "same-origin" });
+    if (!res.ok) return;          // gated: this is a plain customer session
     contacts = (await res.json()).contacts || [];
   } catch (e) { return; }
   if (!contacts.length) return;
