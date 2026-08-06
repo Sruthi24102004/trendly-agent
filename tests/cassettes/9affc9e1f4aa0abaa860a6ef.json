@@ -2,18 +2,11 @@
   "content": "",
   "tool_calls": [
     {
-      "name": "search_policy",
-      "args": {
-        "topic": "lost order"
-      },
-      "id": "Tpe6laH4"
-    },
-    {
       "name": "apply_delayed_credit",
       "args": {
         "order_id": "TR-4526"
       },
-      "id": "HAlvAT4a"
+      "id": "cevfzZvq"
     }
   ],
   "_meta": {

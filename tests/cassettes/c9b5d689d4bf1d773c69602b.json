@@ -2,15 +2,15 @@
   "content": "",
   "tool_calls": [
     {
-      "name": "lookup_order",
+      "name": "apply_delayed_credit",
       "args": {
-        "order_id": "TR-4528"
+        "order_id": "TR-4526"
       },
-      "id": "6zSdIU3s"
+      "id": "GCAHvHvV"
     }
   ],
   "_meta": {
     "model": "gemini-3.5-flash-lite",
-    "key": "9e3991f95014491adebac0a9"
+    "key": "c9b5d689d4bf1d773c69602b"
   }
 }

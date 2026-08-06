@@ -43,14 +43,6 @@ ISSUE_TYPES_DAMAGE = {"damaged", "defective", "wrong_item"}
 # noted as a limitation in SOLUTION.md.
 _ISSUED_DELAY_CREDITS: set[str] = set()
 
-# Same idea for returns/exchanges: without this, a customer who says "return
-# it" twice in one session (or a model that re-calls the tool after a
-# mis-parsed confirmation) raises two return_ids for the same item, and a
-# human ends up reconciling two reverse pickups against one product. Keyed
-# on (order_id, sku) rather than the generated return_id since the whole
-# point is catching the call *before* a second ID is minted.
-_OPEN_RETURNS: dict[tuple[str, str], str] = {}
-
 
 def _now() -> datetime:
     """
@@ -66,6 +58,77 @@ def _now() -> datetime:
 def _load_data() -> dict:
     with open(DATA_PATH, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def find_customer(contact: str) -> dict | None:
+    """
+    Resolve an email address or phone number to a customer.
+
+    Phone numbers are matched on their last 10 digits so that country codes,
+    spaces and dashes don't matter — "+91-98765-10001", "9876510001" and
+    "+919876510001" are the same person to a customer who is typing quickly.
+    """
+    if not contact:
+        return None
+    needle = contact.strip().lower()
+    digits = _digits(needle)
+
+    for customer in _load_data()["customers"]:
+        if customer["email"].lower() == needle:
+            return customer
+        if len(digits) >= 10 and _digits(customer["phone"]).endswith(digits[-10:]):
+            return customer
+    return None
+
+
+def _mask_email(email: str) -> str:
+    name, _, domain = email.partition("@")
+    head = name[:2] if len(name) > 3 else name[:1]
+    return f"{head}{'•' * 5}@{domain}"
+
+
+def _mask_phone(phone: str) -> str:
+    digits = _digits(phone)
+    return f"{'•' * 6}{digits[-4:]}" if len(digits) >= 4 else phone
+
+
+def customer_profile(customer_id: str) -> dict | None:
+    """Profile plus order summaries, for the signed-in customer's own view."""
+    data = _load_data()
+    customer = next(
+        (c for c in data["customers"] if c["customer_id"] == customer_id), None
+    )
+    if not customer:
+        return None
+
+    orders = []
+    for order in data["orders"]:
+        if order["customer_id"] != customer_id:
+            continue
+        orders.append({
+            "order_id": order["order_id"],
+            "status": order["status"],
+            "placed_at": order["placed_at"][:10],
+            "expected_delivery": order["expected_delivery"],
+            "delivered_at": (order["delivered_at"] or "")[:10] or None,
+            "total": order["total"],
+            "items": [i["name"] for i in order["items"]],
+            "carrier": order["carrier"],
+            "tracking_number": order["tracking_number"],
+        })
+    orders.sort(key=lambda o: o["placed_at"], reverse=True)
+
+    return {
+        "customer_id": customer["customer_id"],
+        "name": customer["name"],
+        "email_masked": _mask_email(customer["email"]),
+        "phone_masked": _mask_phone(customer["phone"]),
+        "orders": orders,
+    }
 
 
 def _find_order(order_id: str) -> dict | None:
@@ -191,6 +254,39 @@ def _verdict(outcome: str, reason_code: str, customer_message: str, **extra) -> 
     }
     result.update(extra)
     return result
+
+
+# ---------- TOOL 0: verify_customer ----------
+
+@tool
+def verify_customer(contact: str) -> dict:
+    """Verify who you are speaking to, using the email address or phone number
+    on their Trendly account. This must succeed before you can look up an
+    order, check eligibility, raise a return, or issue a delay credit — every
+    one of those is blocked until the account is verified.
+
+    Accepts an email address or a phone number in any format. If it doesn't
+    match, ask them to check for a typo or try the other one."""
+    customer = find_customer(contact)
+    if not customer:
+        return {
+            "verified": False,
+            "customer_message": (
+                "I couldn't find an account with those details. Could you "
+                "double-check the email address, or try the phone number on "
+                "the order instead?"
+            ),
+        }
+
+    first_name = customer["name"].split()[0]
+    return {
+        "verified": True,
+        "customer_id": customer["customer_id"],
+        "name": customer["name"],
+        "customer_message": (
+            f"Thanks {first_name}, I've found your account. How can I help?"
+        ),
+    }
 
 
 # ---------- TOOL 1: lookup_order ----------
@@ -432,21 +528,6 @@ def initiate_return(
 
     resolution = (resolution or "refund").strip().lower()
 
-    open_key = (order["order_id"], item["sku"])
-    existing_return_id = _OPEN_RETURNS.get(open_key)
-    if existing_return_id:
-        return {
-            "success": False,
-            "error": "already_initiated",
-            "return_id": existing_return_id,
-            "customer_message": (
-                f"I've already raised this for your {item['name']} — the "
-                f"reference is {existing_return_id}, so there's no need to "
-                "start it again. Let me know if you'd like a status update "
-                "on that instead."
-            ),
-        }
-
     if resolution == "exchange":
         if not new_size:
             return {
@@ -454,11 +535,9 @@ def initiate_return(
                 "error": "missing_size",
                 "customer_message": "Which size would you like instead?",
             }
-        exc_id = f"EXC-{order['order_id']}-{item['sku']}"
-        _OPEN_RETURNS[open_key] = exc_id
         return {
             "success": True,
-            "return_id": exc_id,
+            "return_id": f"EXC-{order['order_id']}-{item['sku']}",
             "type": "size_exchange",
             "item": item["name"],
             "new_size": new_size,
@@ -479,11 +558,9 @@ def initiate_return(
     }
     timeline = timelines.get(payment_method, "per the timelines in our refund policy")
 
-    ret_id = f"RET-{order['order_id']}-{item['sku']}"
-    _OPEN_RETURNS[open_key] = ret_id
     result = {
         "success": True,
-        "return_id": ret_id,
+        "return_id": f"RET-{order['order_id']}-{item['sku']}",
         "type": "refund_return",
         "item": item["name"],
         "customer_message": (
@@ -581,13 +658,46 @@ def apply_delayed_credit(order_id: str) -> dict:
 
 # ---------- TOOL 6: escalate_to_human ----------
 
+# Escalation reasons, split by whether policy *requires* a human or the agent
+# simply couldn't cope. Ops needs that distinction: the first group is the
+# system working as designed, the second is a backlog to fix.
+ESCALATION_REASONS = (
+    "lost_parcel_claim",
+    "damaged_item_photos",
+    "cod_bank_details",
+    "uncovered_policy",
+    "customer_dispute",
+    "out_of_scope_request",
+    "tool_failure",
+)
+
+
+def _infer_reason(order: dict | None) -> str:
+    """
+    Fallback when the model omits `reason`. Every model-driven escalation was
+    landing in "unspecified", which collapsed the dashboard's policy-mandated
+    vs agent-limitation split into a single meaningless bucket.
+    """
+    if order:
+        if order["status"] == "lost_in_transit":
+            return "lost_parcel_claim"
+        if order.get("payment_method") == "cash_on_delivery":
+            return "cod_bank_details"
+    return "out_of_scope_request"
+
+
 @tool
-def escalate_to_human(summary: str, reason: str, order_id: str = "") -> dict:
+def escalate_to_human(summary: str, reason: str = "", order_id: str = "") -> dict:
     """Hand off to a human agent. Use when the request is outside what you can
-    do (lost parcels, damaged-item photos, discounts, bank details, disputes),
-    when a tool fails repeatedly, or when the policy doesn't cover the
-    question. `summary` must be written for the agent picking this up: what
-    the customer wants, what you already established, and what's left to do."""
+    do (lost parcels, damaged-item photos, bank details, disputes), when a tool
+    fails repeatedly, or when the policy doesn't cover the question.
+
+    `summary` must be written for the agent picking this up: what the customer
+    wants, what you already established, and what's left to do.
+
+    `reason` must be one of: lost_parcel_claim, damaged_item_photos,
+    cod_bank_details, uncovered_policy, customer_dispute, out_of_scope_request,
+    tool_failure. Always pass it — it is what routes the ticket."""
     ticket_id = f"ESC-{order_id or 'GEN'}-{_now().strftime('%d%H%M%S')}"
 
     # Attach the order snapshot so the human doesn't repeat the lookup. This
@@ -609,6 +719,10 @@ def escalate_to_human(summary: str, reason: str, order_id: str = "") -> dict:
             "items": _item_summary(order),
         }
 
+    reason = (reason or "").strip().lower()
+    if reason not in ESCALATION_REASONS:
+        reason = _infer_reason(order)
+
     return {
         "escalated": True,
         "ticket_id": ticket_id,
@@ -624,6 +738,7 @@ def escalate_to_human(summary: str, reason: str, order_id: str = "") -> dict:
 
 
 ALL_TOOLS = [
+    verify_customer,
     lookup_order,
     search_policy,
     check_return_eligibility,

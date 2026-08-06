@@ -1,14 +1,6 @@
 {
-  "content": "",
-  "tool_calls": [
-    {
-      "name": "search_policy",
-      "args": {
-        "topic": "delayed delivery credit"
-      },
-      "id": "NLWjtUFN"
-    }
-  ],
+  "content": "I'm sorry for the confusion! Looking up order TR-4524, it was sent as a partial shipment. \n\nThe High-Rise Straight Jeans were in that box, but the Woven Leather Belt is currently on backorder and is expected to ship around August 9, 2026. It'll be on its way to you as soon as it's ready.",
+  "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",
     "key": "44d3800ec496de54b5d8a896"

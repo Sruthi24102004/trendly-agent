@@ -1,0 +1,18 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "escalate_to_human",
+      "args": {
+        "order_id": "TR-4526",
+        "reason": "lost_parcel_claim",
+        "summary": "Customer's order TR-4526 (Canvas Tote) never arrived and is marked lost in transit by the carrier (30 days past expected delivery). Customer wants to know what to do; needs a free replacement or a full refund."
+      },
+      "id": "XaJy2kB4"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "98e0b9eb28d45290fe738581"
+  }
+}

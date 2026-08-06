@@ -12,16 +12,62 @@ inner panes scroll, so nothing important sits below the fold during a demo.
 """
 
 import os
+import secrets
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from app.agent import MODEL, PROVIDER, run_agent
+from app.agent import MODEL, PROVIDER, get_session_history, graph, run_agent
+from app.tools import customer_profile
 from app.cassettes import mode as cassette_mode
-from app.observability import summarize
+from app.observability import list_sessions, summarize
 
 app = FastAPI(title="Trendly Support Agent")
+
+# ---------- Operator routes ----------
+# /metrics, /sessions, /dashboard and /history expose every conversation the
+# agent has served, across all customers. That is an operator view, not a
+# customer one, so it is gated:
+#
+#   ADMIN_TOKEN set    -> a matching token is required from anywhere
+#   ADMIN_TOKEN unset  -> local requests only; anything else 404s
+#
+# 404 rather than 403 on purpose: an unauthenticated caller shouldn't learn
+# that an admin surface exists. The customer chat page links to none of it.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+ADMIN_COOKIE = "trendly_admin"
+LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _is_admin(request: Request) -> bool:
+    if ADMIN_TOKEN:
+        supplied = (
+            request.headers.get("x-admin-token")
+            or request.query_params.get("token")
+            or request.cookies.get(ADMIN_COOKIE)
+            or ""
+        )
+        return secrets.compare_digest(supplied, ADMIN_TOKEN)
+    host = request.client.host if request.client else ""
+    return host in LOCAL_HOSTS
+
+
+def require_admin(request: Request) -> None:
+    if not _is_admin(request):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _admin_page(request: Request, html: str) -> HTMLResponse:
+    """Serve an operator page, remembering a token passed as ?token=... so the
+    page's own fetch calls to /metrics and /sessions are authorised too."""
+    response = HTMLResponse(html)
+    token = request.query_params.get("token")
+    if ADMIN_TOKEN and token and secrets.compare_digest(token, ADMIN_TOKEN):
+        response.set_cookie(
+            ADMIN_COOKIE, token, httponly=True, samesite="strict", max_age=86400
+        )
+    return response
 
 
 class ChatRequest(BaseModel):
@@ -38,20 +84,73 @@ class ChatResponse(BaseModel):
 
 
 @app.get("/health")
-def health():
+def health(request: Request):
+    """Public liveness probe. Which model and configuration is running is
+    operator information, so it is only included for an admin caller."""
+    if not _is_admin(request):
+        return {"status": "ok"}
     return {
         "status": "ok",
         "provider": PROVIDER,
         "model": MODEL,
         "cassette_mode": cassette_mode(),
         "clock_override": os.environ.get("TRENDLY_NOW"),
+        "admin_auth": "token" if ADMIN_TOKEN else "localhost-only",
     }
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(require_admin)])
 def metrics():
     """Aggregate view of every turn served. Consumed by /dashboard."""
     return summarize()
+
+
+@app.get("/sessions", dependencies=[Depends(require_admin)])
+def sessions_index(limit: int = 200):
+    """Every conversation the agent has served, newest first."""
+    return {"sessions": list_sessions(limit)}
+
+
+@app.get("/history", response_class=HTMLResponse,
+         dependencies=[Depends(require_admin)])
+def history(request: Request):
+    return _admin_page(request, HISTORY_PAGE)
+
+
+@app.get("/session/{session_id}")
+def session(session_id: str):
+    """Replay a conversation from the checkpointer so the customer's own page
+    can rehydrate after a refresh.
+
+    Deliberately not admin-gated — the customer needs it — so it is protected
+    only by the unguessability of the session id. That is weak: anyone holding
+    an id can read that conversation. Real deployment ties the thread to an
+    authenticated user instead, which is the same gap the cross-customer
+    binding papers over. Noted in SOLUTION.md."""
+    try:
+        return get_session_history(session_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/session/{session_id}/customer")
+def session_customer(session_id: str):
+    """
+    The signed-in customer's own profile and orders, for the panel beside the
+    chat. Returns nothing until the session has been verified, and only ever
+    the customer bound to this session — contact details come back masked,
+    since the point is to confirm which account is open, not to display it.
+    """
+    try:
+        snapshot = graph.get_state({"configurable": {"thread_id": session_id}})
+        values = snapshot.values if snapshot else {}
+        customer_id = values.get("session_customer_id")
+        if not customer_id:
+            return {"verified": False}
+        profile = customer_profile(customer_id)
+        return {"verified": True, **profile} if profile else {"verified": False}
+    except Exception:
+        return {"verified": False}
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -69,9 +168,10 @@ def index():
     return CHAT_PAGE
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return DASHBOARD_PAGE
+@app.get("/dashboard", response_class=HTMLResponse,
+         dependencies=[Depends(require_admin)])
+def dashboard(request: Request):
+    return _admin_page(request, DASHBOARD_PAGE)
 
 
 BASE_CSS = """
@@ -118,68 +218,89 @@ BASE_CSS = """
 CHAT_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Trendly Support</title><style>""" + BASE_CSS + """
-  .main { display:grid; grid-template-columns:minmax(0,1fr) 300px; gap:14px;
-          min-height:0; }
+  .main { display:grid; grid-template-columns:minmax(0,1fr) 316px; gap:14px; min-height:0; }
   .chatcol { display:grid; grid-template-rows:1fr auto auto; gap:10px; min-height:0; }
 
-  #chat { overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:14px; }
-  .turn { display:flex; flex-direction:column; gap:5px; max-width:82%; }
+  #chat { overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:16px;
+          scroll-behavior:smooth; }
+  .turn { display:flex; flex-direction:column; gap:5px; max-width:80%;
+          animation:rise .28s cubic-bezier(.2,.8,.3,1); }
   .turn.me { align-self:flex-end; align-items:flex-end; }
+  @keyframes rise { from { opacity:0; transform:translateY(7px); } to { opacity:1; transform:none; } }
   .who { font-size:10px; letter-spacing:.11em; text-transform:uppercase; color:var(--dim); }
-  .bubble { padding:11px 14px; border-radius:13px; white-space:pre-wrap;
-            word-break:break-word; }
+  .bubble { padding:12px 15px; border-radius:14px; white-space:pre-wrap;
+            word-break:break-word; line-height:1.55; }
   .me .bubble { background:linear-gradient(160deg,var(--accent),#c9902f);
-                color:#1a1206; border-bottom-right-radius:4px; font-weight:500; }
+                color:#1a1206; border-bottom-right-radius:5px; font-weight:500; }
   .bot .bubble { background:var(--panel-2); border:1px solid var(--line);
-                 border-bottom-left-radius:4px; }
+                 border-bottom-left-radius:5px; }
   .err .bubble { background:#3a1616; border:1px solid #5c2626; color:#fecaca; }
-
-  .trace { display:flex; flex-wrap:wrap; gap:5px; }
-  .chip { font-size:10.5px; padding:2.5px 8px; border-radius:6px; background:#1a2130;
-          border:1px solid var(--line); color:var(--muted); }
-  .chip.out { color:var(--info); border-color:#24384a; }
-  .chip.block { color:var(--warn); border-color:#4a3a1c; }
-  .chip.viol { color:var(--bad); border-color:#4d2424; }
-  .chip.esc { color:var(--bad); border-color:#4d2424; }
-  .chip .ms { color:var(--dim); }
-
   .note { align-self:center; font-size:11.5px; color:var(--dim); font-style:italic;
-          padding:5px 12px; border-radius:999px; background:#151a25;
+          padding:6px 14px; border-radius:999px; background:#151a25;
           border:1px dashed var(--line); }
+
+  .hero { margin:auto; text-align:center; max-width:400px; padding:20px; }
+  .hero .mark { width:46px; height:46px; border-radius:13px; margin:0 auto 14px;
+    background:linear-gradient(140deg,var(--accent),var(--accent-dim));
+    display:grid; place-items:center; color:#1a1206; font-weight:700; font-size:20px; }
+  .hero h2 { font-size:17px; margin:0 0 6px; font-weight:600; }
+  .hero p { font-size:13px; color:var(--muted); margin:0; line-height:1.6; }
+
   .dots span { display:inline-block; width:5px; height:5px; margin-right:3px;
     border-radius:50%; background:var(--dim); animation:b 1.2s infinite; }
   .dots span:nth-child(2){animation-delay:.18s} .dots span:nth-child(3){animation-delay:.36s}
   @keyframes b { 0%,60%,100%{opacity:.25;transform:translateY(0)} 30%{opacity:1;transform:translateY(-3px)} }
 
-  .composer { display:flex; gap:9px; padding:9px; align-items:center; }
-  input { flex:1; padding:11px 13px; border-radius:9px; border:1px solid transparent;
+  .composer { display:flex; gap:9px; padding:9px; align-items:center;
+              transition:border-color .18s; }
+  .composer:focus-within { border-color:var(--accent-dim); }
+  input[type=text] { flex:1; padding:11px 13px; border-radius:9px; border:1px solid transparent;
           background:var(--panel-2); color:var(--text); font-size:14px; outline:none; }
-  input:focus { border-color:var(--accent-dim); }
   .send { padding:11px 18px; border:0; border-radius:9px; cursor:pointer;
-          background:var(--accent); color:#1a1206; font-weight:600; font-size:13.5px; }
+          background:var(--accent); color:#1a1206; font-weight:600; font-size:13.5px;
+          transition:transform .12s, opacity .12s; }
+  .send:hover:not(:disabled) { transform:translateY(-1px); }
   .send:disabled { opacity:.4; cursor:default; }
 
-  .presets { display:flex; gap:6px; overflow-x:auto; padding-bottom:2px; }
-  .presets button { flex:none; padding:5px 11px; font-size:11.5px; cursor:pointer;
+  .quick { display:flex; gap:6px; overflow-x:auto; padding-bottom:2px; }
+  .quick button { flex:none; padding:6px 12px; font-size:11.5px; cursor:pointer;
     border-radius:999px; border:1px solid var(--line); background:var(--panel);
-    color:var(--muted); white-space:nowrap; }
-  .presets button:hover { color:var(--accent); border-color:var(--accent-dim); }
+    color:var(--muted); white-space:nowrap; transition:all .15s; }
+  .quick button:hover { color:var(--accent); border-color:var(--accent-dim);
+    transform:translateY(-1px); }
 
-  .side { overflow-y:auto; padding:14px; }
+  .side { overflow-y:auto; padding:15px; }
   .side h3 { font-size:10px; letter-spacing:.11em; text-transform:uppercase;
-             color:var(--dim); margin:18px 0 8px; font-weight:600; }
+             color:var(--dim); margin:18px 0 9px; font-weight:600; }
   .side h3:first-child { margin-top:0; }
-  .kv { display:flex; justify-content:space-between; gap:10px; font-size:12px;
-        padding:5px 0; border-bottom:1px solid #1b2130; }
-  .kv b { font-weight:400; color:var(--muted); }
-  .kv span { text-align:right; word-break:break-all; font-size:11.5px; }
-  .tag { display:inline-block; font-size:11px; padding:3px 8px; border-radius:6px;
-         background:#1a2130; border:1px solid var(--line); color:var(--muted);
-         margin:0 4px 4px 0; }
-  .tag.none { color:var(--dim); font-style:italic; border-style:dashed; }
-  .tag.ok { color:var(--ok); border-color:#25462f; }
-  .tag.no { color:var(--bad); border-color:#4d2424; }
-  .tag.ex { color:var(--warn); border-color:#4a3a1c; }
+  .locked { text-align:center; padding:26px 12px; color:var(--dim); }
+  .locked .ico { font-size:22px; opacity:.5; }
+  .locked p { font-size:12px; line-height:1.6; margin:10px 0 0; }
+
+  .who-card { display:flex; align-items:center; gap:11px; padding:11px;
+    border-radius:10px; background:var(--panel-2); border:1px solid var(--line); }
+  .avatar { width:36px; height:36px; border-radius:50%; flex:none; display:grid;
+    place-items:center; font-weight:600; font-size:13px; color:#1a1206;
+    background:linear-gradient(140deg,var(--accent),var(--accent-dim)); }
+  .who-card .nm { font-size:13px; font-weight:600; }
+  .who-card .vf { font-size:10.5px; color:var(--ok); margin-top:1px; }
+  .contact { font-size:11.5px; color:var(--muted); padding:7px 0;
+    border-bottom:1px solid #1b2130; display:flex; justify-content:space-between; gap:8px; }
+  .contact span:last-child { font-family:ui-monospace,monospace; color:var(--dim); }
+
+  .order { padding:10px 11px; border-radius:9px; border:1px solid var(--line);
+    background:var(--panel-2); margin-bottom:7px; cursor:pointer; transition:all .15s; }
+  .order:hover { border-color:var(--accent-dim); transform:translateY(-1px); }
+  .order .top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .order .oid { font-size:12px; font-family:ui-monospace,monospace; font-weight:600; }
+  .order .items { font-size:11px; color:var(--muted); margin-top:4px; line-height:1.45; }
+  .st { font-size:9.5px; padding:2px 7px; border-radius:999px; white-space:nowrap;
+        text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
+  .st.delivered { color:var(--ok); background:#12281c; }
+  .st.transit { color:var(--info); background:#122430; }
+  .st.late { color:var(--warn); background:#2a2113; }
+  .st.bad { color:var(--bad); background:#2c1618; }
+  .st.off { color:var(--dim); background:#1a1f2b; }
 
   @media (max-width:900px) {
     .main { grid-template-columns:1fr; grid-template-rows:1fr auto; }
@@ -190,107 +311,53 @@ CHAT_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
   <header>
     <div class="logo">T</div>
     <div>
-      <h1>Trendly Support Assistant</h1>
-      <div class="tagline">Tool calls, guardrail blocks and reply validation shown under each reply</div>
+      <h1>Trendly Support</h1>
+      <div class="tagline">Orders, returns, exchanges and delivery — 9 AM to 9 PM IST, every day</div>
     </div>
     <div class="spacer"></div>
-    <div class="badge" id="model-badge"><span class="dot"></span>connecting…</div>
-    <button class="badge btn" id="new-session" title="Clears conversation state">New session</button>
-    <a class="badge" href="/dashboard">Ops dashboard →</a>
+    <div class="badge" id="status-badge"><span class="dot"></span>Online</div>
+    <button class="badge btn" id="end-session" title="Clears this conversation">End chat</button>
   </header>
 
   <div class="main">
     <div class="chatcol">
       <div class="card" id="chat"></div>
-      <div class="presets" id="presets"></div>
+      <div class="quick" id="quick"></div>
       <div class="card composer">
-        <input id="input" placeholder="Ask about an order, a return, or our policy…" autofocus />
+        <input type="text" id="input" placeholder="Type your message…" autofocus />
         <button class="send" id="send" onclick="send()">Send</button>
       </div>
     </div>
-
-    <div class="card side">
-      <h3>Session state</h3>
-      <div class="kv"><b>session</b><span class="mono" id="s-id">—</span></div>
-      <div class="kv"><b>bound customer</b><span class="mono" id="s-cust">not bound</span></div>
-      <h3>Orders looked up</h3>
-      <div id="s-orders"><span class="tag none">none</span></div>
-      <h3>Eligibility decided</h3>
-      <div id="s-elig"><span class="tag none">none</span></div>
-      <h3>Last turn</h3>
-      <div class="kv"><b>model</b><span class="mono" id="d-model">—</span></div>
-      <div class="kv"><b>latency</b><span class="mono" id="d-latency">—</span></div>
-      <div class="kv"><b>agent steps</b><span class="mono" id="d-iter">—</span></div>
-      <div class="kv"><b>blocked calls</b><span class="mono" id="d-blocked">—</span></div>
-      <div class="kv"><b>redrafts</b><span class="mono" id="d-retries">—</span></div>
-      <div class="kv"><b>escalation</b><span class="mono" id="d-esc">—</span></div>
-    </div>
+    <div class="card side" id="side"></div>
   </div>
 </div>
 
 <script>
-let sessionId, boundCustomer = null;
+const SESSION_KEY = "trendly.session";
+let sessionId, verified = false;
 const chat = document.getElementById("chat");
 const input = document.getElementById("input");
 const button = document.getElementById("send");
+const side = document.getElementById("side");
 
-fetch("/health").then(r => r.json()).then(h => {
-  document.getElementById("model-badge").innerHTML =
-    '<span class="dot"></span>' + h.model +
-    (h.cassette_mode && h.cassette_mode !== "off" ? " &middot; " + h.cassette_mode : "");
-}).catch(() => {});
-
-// Each preset records the customer who owns the order it references. A
-// session binds to a customer on its first lookup and then refuses orders
-// belonging to anyone else — correct in production, where one chat is one
-// customer, but it means clicking presets across four customers in a single
-// session blocks everything after the first. So a preset that crosses a
-// customer boundary starts a fresh session and says so, rather than
-// weakening the guardrail to make the demo convenient.
-const PRESETS = [
-  ["Happy path",     "I'd like to return my kurta from order TR-4530, wrong size.", "C-101"],
-  ["Final sale",     "I want to return my shirt from TR-4528, wrong size.", "C-103"],
-  ["Jewellery",      "Can I return the earrings from order TR-4527?", "C-102"],
-  ["Out of window",  "I want to return the jacket from TR-4523, it doesn't fit.", "C-102"],
-  ["Lost parcel",    "Order TR-4526 never arrived, what do I do?", "C-101"],
-  ["Delayed",        "Where is my order TR-4525? It's really late.", "C-103"],
-  ["Partial",        "Order TR-4524 only had one thing in the box.", "C-100"],
-  ["Cancelled",      "Can I return the scarf from TR-4529?", "C-100"],
-  ["Damaged",        "The earrings from TR-4527 turned up cracked and broken.", "C-102"],
-  ["Ambiguous item", "I'd like to return the leather jacket from order TR-4524.", "C-100"],
-  ["Cross-customer", "Who placed order TR-4522 and what's in it?", null],
-  ["Discount",       "Can you give me a 20% discount code?", null],
-  ["Policy",         "How long does a refund take once you receive my return?", null]
+const QUICK_BEFORE = [
+  ["Where's my order?", "Where's my order?"],
+  ["Return an item", "I'd like to return something."],
+  ["Exchange a size", "I need to exchange an item for a different size."],
+  ["Refund status", "When will my refund come through?"],
+  ["Delivery times", "How long does delivery usually take?"],
+  ["Return policy", "What's your return policy?"],
+  ["Talk to a person", "Can I speak to a human agent please?"]
 ];
-const presets = document.getElementById("presets");
-PRESETS.forEach(function (p) {
-  const b = document.createElement("button");
-  b.textContent = p[0];
-  b.onclick = function () {
-    if (p[2] && boundCustomer && p[2] !== boundCustomer) {
-      newSession("That order belongs to a different customer — starting a new session.");
-    }
-    input.value = p[1];
-    send();
-  };
-  presets.appendChild(b);
-});
-
-function newSession(note) {
-  sessionId = "demo-" + Math.random().toString(36).slice(2, 10);
-  boundCustomer = null;
-  document.getElementById("s-id").textContent = sessionId;
-  document.getElementById("s-cust").textContent = "not bound";
-  tags(document.getElementById("s-orders"), []);
-  tags(document.getElementById("s-elig"), []);
-  ["d-model", "d-latency", "d-iter", "d-blocked", "d-retries", "d-esc"]
-    .forEach(function (id) { document.getElementById(id).textContent = "—"; });
-  if (note) {
-    const n = el("div", "note", note);
-    chat.appendChild(n);
-    chat.scrollTop = chat.scrollHeight;
-  }
-}
+const QUICK_AFTER = [
+  ["Track an order", "Can you tell me where my order is?"],
+  ["Return an item", "I'd like to return an item from one of my orders."],
+  ["Exchange a size", "I'd like to exchange an item for a different size."],
+  ["Refund status", "When will my refund come through?"],
+  ["Damaged item", "Something arrived damaged."],
+  ["Return policy", "What's your return policy?"],
+  ["Talk to a person", "Can I speak to a human agent please?"]
+];
 
 function el(tag, cls, text) {
   const d = document.createElement(tag);
@@ -299,7 +366,29 @@ function el(tag, cls, text) {
   return d;
 }
 
+function renderQuick() {
+  const box = document.getElementById("quick");
+  box.innerHTML = "";
+  (verified ? QUICK_AFTER : QUICK_BEFORE).forEach(function (q) {
+    const b = el("button", "", q[0]);
+    b.onclick = function () { input.value = q[1]; send(); };
+    box.appendChild(b);
+  });
+}
+
+function welcome() {
+  const hero = el("div", "hero");
+  hero.appendChild(el("div", "mark", "T"));
+  hero.appendChild(el("h2", "", "Hi, how can we help?"));
+  hero.appendChild(el("p", "",
+    "Ask about an order, a return or our policies. To look up anything on " +
+    "your account we'll check your email or phone number first."));
+  chat.appendChild(hero);
+}
+
 function addTurn(who, text, cls) {
+  const hero = chat.querySelector(".hero");
+  if (hero) hero.remove();
   const wrap = el("div", "turn " + cls);
   wrap.appendChild(el("div", "who", who));
   wrap.appendChild(el("div", "bubble", text));
@@ -308,56 +397,87 @@ function addTurn(who, text, cls) {
   return wrap;
 }
 
-function addTrace(wrap, data) {
-  const calls = data.tool_calls_made || [];
-  const d = data.diagnostics || {};
-  const viols = d.validation_violations || [];
-  if (!calls.length && !viols.length && !data.escalated) return;
+function statusClass(s) {
+  if (s === "delivered") return "delivered";
+  if (s === "in_transit" || s === "partially_shipped") return "transit";
+  if (s === "delayed") return "late";
+  if (s === "lost_in_transit") return "bad";
+  return "off";
+}
+function statusLabel(s) { return (s || "").replace(/_/g, " "); }
 
-  const row = el("div", "trace");
-  calls.forEach(function (c) {
-    const r = c.result || {};
-    if (r.blocked) { row.appendChild(el("span", "chip block", c.tool + " · blocked")); return; }
-    row.appendChild(el("span", r.outcome ? "chip out" : "chip",
-      c.tool + (r.outcome ? " · " + r.outcome : "")));
-  });
-  if (viols.length) row.appendChild(el("span", "chip viol", "redrafted · " + viols.join(", ")));
-  if (data.escalated) row.appendChild(el("span", "chip esc", "escalated" + (d.escalation_reason ? " · " + d.escalation_reason : "")));
-  if (d.latency_ms) row.appendChild(el("span", "chip", Math.round(d.latency_ms) + " ms"));
-  wrap.appendChild(row);
-  chat.scrollTop = chat.scrollHeight;
+function lockedPanel() {
+  side.innerHTML = "";
+  const box = el("div", "locked");
+  box.appendChild(el("div", "ico", "🔒"));
+  box.appendChild(el("p", "",
+    "Your account details and orders will appear here once we've confirmed " +
+    "your email address or phone number."));
+  side.appendChild(box);
 }
 
-function tags(el_, items, clsOf) {
-  el_.innerHTML = "";
-  if (!items.length) { el_.appendChild(el("span", "tag none", "none")); return; }
-  items.forEach(function (t) {
-    el_.appendChild(el("span", "tag " + (clsOf ? clsOf(t) : ""), t));
+function renderCustomer(p) {
+  side.innerHTML = "";
+  side.appendChild(el("h3", "", "Your account"));
+
+  const card = el("div", "who-card");
+  const initials = p.name.split(" ").map(function (n) { return n[0]; }).join("").slice(0, 2);
+  card.appendChild(el("div", "avatar", initials));
+  const who = el("div");
+  who.appendChild(el("div", "nm", p.name));
+  who.appendChild(el("div", "vf", "✓ Verified"));
+  card.appendChild(who);
+  side.appendChild(card);
+
+  const email = el("div", "contact");
+  email.appendChild(el("span", "", "Email"));
+  email.appendChild(el("span", "", p.email_masked));
+  side.appendChild(email);
+  const phone = el("div", "contact");
+  phone.appendChild(el("span", "", "Phone"));
+  phone.appendChild(el("span", "", p.phone_masked));
+  side.appendChild(phone);
+
+  side.appendChild(el("h3", "", "Your orders (" + p.orders.length + ")"));
+  p.orders.forEach(function (o) {
+    const row = el("div", "order");
+    const top = el("div", "top");
+    top.appendChild(el("div", "oid", o.order_id));
+    top.appendChild(el("div", "st " + statusClass(o.status), statusLabel(o.status)));
+    row.appendChild(top);
+    row.appendChild(el("div", "items", o.items.join(", ")));
+    row.onclick = function () {
+      input.value = "Tell me about order " + o.order_id;
+      send();
+    };
+    side.appendChild(row);
   });
 }
 
-function updateSide(data) {
-  const s = data.state || {}, d = data.diagnostics || {};
-  boundCustomer = s.session_customer_id || null;
-  document.getElementById("s-cust").textContent = s.session_customer_id || "not bound";
-  tags(document.getElementById("s-orders"), s.looked_up_orders || []);
+async function refreshSide() {
+  try {
+    const p = await (await fetch("/session/" + encodeURIComponent(sessionId) + "/customer")).json();
+    if (p.verified) {
+      const was = verified;
+      verified = true;
+      renderCustomer(p);
+      if (!was) renderQuick();
+    } else {
+      verified = false;
+      lockedPanel();
+    }
+  } catch (e) { lockedPanel(); }
+}
 
-  const eo = s.eligibility_outcomes || {};
-  const rows = Object.keys(eo).map(function (k) { return k.split("|")[1] + " · " + eo[k]; });
-  tags(document.getElementById("s-elig"), rows, function (t) {
-    if (t.indexOf("eligible_refund") > -1) return "ok";
-    if (t.indexOf("exchange_only") > -1) return "ex";
-    return "no";
-  });
-
-  document.getElementById("d-model").textContent =
-    (d.model_used || "—") + (d.fallback_used ? " (fallback)" : "");
-  document.getElementById("d-latency").textContent =
-    d.latency_ms ? Math.round(d.latency_ms) + " ms" : "—";
-  document.getElementById("d-iter").textContent = s.iterations_this_turn;
-  document.getElementById("d-blocked").textContent = d.blocked_calls || 0;
-  document.getElementById("d-retries").textContent = s.validation_retries || 0;
-  document.getElementById("d-esc").textContent = d.escalation_reason || "none";
+function newSession(note) {
+  sessionId = "s-" + Math.random().toString(36).slice(2, 10);
+  verified = false;
+  try { sessionStorage.setItem(SESSION_KEY, sessionId); } catch (e) {}
+  chat.innerHTML = "";
+  if (note) chat.appendChild(el("div", "note", note));
+  welcome();
+  lockedPanel();
+  renderQuick();
 }
 
 async function send() {
@@ -383,27 +503,57 @@ async function send() {
     pending.remove();
     if (!res.ok) {
       const e = await res.json().catch(function () { return { detail: res.statusText }; });
-      addTurn("Error", "Server error (" + res.status + "): " + (e.detail || "unknown"), "bot err");
+      addTurn("Trendly", "Sorry — something went wrong on our end (" + res.status +
+        "). Please try again in a moment.", "bot err");
       return;
     }
     const data = await res.json();
-    const wrap = addTurn("Trendly", data.reply, "bot");
-    addTrace(wrap, data);
-    updateSide(data);
+    addTurn("Trendly", data.reply, "bot");
+    refreshSide();
   } catch (err) {
     pending.remove();
-    addTurn("Error", "Request failed: " + err.message, "bot err");
+    addTurn("Trendly", "I couldn't reach our systems just then. Please try again.", "bot err");
   } finally {
     button.disabled = false;
     input.focus();
   }
 }
-input.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
-document.getElementById("new-session").onclick = function () {
-  newSession("New session started.");
-  input.focus();
+
+document.getElementById("end-session").onclick = function () {
+  if (!chat.querySelector(".turn")) return;
+  addTurn("Trendly", "Thanks for chatting with us. This conversation is now " +
+    "closed — start a new one any time and we'll pick things up fresh.", "bot");
+  button.disabled = true;
+  input.disabled = true;
+  setTimeout(function () {
+    newSession("Previous chat ended.");
+    button.disabled = false;
+    input.disabled = false;
+    input.focus();
+  }, 2600);
 };
-newSession();
+
+input.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
+
+async function restore() {
+  let saved = null;
+  try { saved = sessionStorage.getItem(SESSION_KEY); } catch (e) {}
+  if (!saved) { newSession(); return; }
+  sessionId = saved;
+  renderQuick();
+  try {
+    const data = await (await fetch("/session/" + encodeURIComponent(saved))).json();
+    if (data.exists) {
+      (data.turns || []).forEach(function (t) {
+        addTurn(t.role === "user" ? "You" : "Trendly", t.content,
+                t.role === "user" ? "me" : "bot");
+      });
+      chat.appendChild(el("div", "note", "Conversation restored."));
+    } else { welcome(); }
+  } catch (e) { welcome(); }
+  refreshSide();
+}
+restore();
 </script></body></html>
 """
 
@@ -444,8 +594,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
       <div class="tagline">Live from the turn-level event log, refreshed every 5s</div>
     </div>
     <div class="spacer"></div>
+    <a class="badge" href="/history">History</a>
     <a class="badge" href="/metrics">Raw JSON</a>
-    <a class="badge" href="/">← Back to chat</a>
   </header>
   <div class="body" id="body"><div class="card panel"><div class="empty">Loading…</div></div></div>
 </div>
@@ -507,5 +657,183 @@ async function load() {
     '</div>';
 }
 load(); setInterval(load, 5000);
+</script></body></html>
+"""
+
+
+HISTORY_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trendly Agent — History</title><style>""" + BASE_CSS + """
+  .main { display:grid; grid-template-columns:330px minmax(0,1fr); gap:14px; min-height:0; }
+  .list { overflow-y:auto; padding:8px; }
+  .filters { display:flex; gap:6px; padding:6px 6px 10px; flex-wrap:wrap; }
+  .filters button { flex:none; padding:4px 10px; font-size:11px; cursor:pointer;
+    border-radius:999px; border:1px solid var(--line); background:var(--panel-2);
+    color:var(--muted); }
+  .filters button.on { color:var(--accent); border-color:var(--accent-dim); }
+  .grouphead { font-size:10px; letter-spacing:.11em; text-transform:uppercase;
+    color:var(--dim); padding:12px 8px 5px; font-weight:600; }
+  .item { padding:9px 10px; border-radius:9px; cursor:pointer; border:1px solid transparent; }
+  .item:hover { background:var(--panel-2); }
+  .item.on { background:var(--panel-2); border-color:var(--accent-dim); }
+  .item .id { font-size:12px; font-family:ui-monospace,monospace; }
+  .item .meta { font-size:11px; color:var(--dim); margin-top:3px;
+    display:flex; gap:8px; flex-wrap:wrap; }
+  .item .meta .esc { color:var(--bad); }
+  .item .meta .blk { color:var(--warn); }
+  .transcript { overflow-y:auto; padding:18px; display:flex;
+    flex-direction:column; gap:14px; }
+  .turn { display:flex; flex-direction:column; gap:5px; max-width:84%; }
+  .turn.me { align-self:flex-end; align-items:flex-end; }
+  .who { font-size:10px; letter-spacing:.11em; text-transform:uppercase; color:var(--dim); }
+  .bubble { padding:11px 14px; border-radius:13px; white-space:pre-wrap;
+    word-break:break-word; }
+  .me .bubble { background:linear-gradient(160deg,var(--accent),#c9902f);
+    color:#1a1206; border-bottom-right-radius:4px; font-weight:500; }
+  .bot .bubble { background:var(--panel-2); border:1px solid var(--line);
+    border-bottom-left-radius:4px; }
+  .trace { display:flex; flex-wrap:wrap; gap:5px; }
+  .chip { font-size:10.5px; padding:2.5px 8px; border-radius:6px; background:#1a2130;
+    border:1px solid var(--line); color:var(--muted); }
+  .chip.out { color:var(--info); border-color:#24384a; }
+  .chip.block { color:var(--warn); border-color:#4a3a1c; }
+  .empty { color:var(--dim); font-size:13px; font-style:italic; padding:18px; }
+  .sumbar { font-size:11.5px; color:var(--dim); padding:9px 14px;
+    border-bottom:1px solid var(--line); display:flex; gap:14px; flex-wrap:wrap; }
+  .pane { display:grid; grid-template-rows:auto 1fr; min-height:0; }
+  @media (max-width:880px) { .main { grid-template-columns:1fr; } .list { max-height:220px; } }
+</style></head><body>
+<div class="shell">
+  <header>
+    <div class="logo">T</div>
+    <div>
+      <h1>Conversation history</h1>
+      <div class="tagline">Every session the agent has served — transcripts replayed from the checkpointer</div>
+    </div>
+    <div class="spacer"></div>
+    <a class="badge" href="/dashboard">Ops dashboard</a>
+  </header>
+  <div class="main">
+    <div class="card list">
+      <div class="filters" id="filters"></div>
+      <div id="items"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="card pane">
+      <div class="sumbar" id="sumbar">Select a conversation</div>
+      <div class="transcript" id="transcript"><div class="empty">Nothing selected.</div></div>
+    </div>
+  </div>
+</div>
+<script>
+let sessions = [], filter = null, selected = null;
+
+function el(tag, cls, text) {
+  const d = document.createElement(tag);
+  if (cls) d.className = cls;
+  if (text !== undefined) d.textContent = text;
+  return d;
+}
+function ago(iso) {
+  if (!iso) return "";
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins + "m ago";
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + "h ago";
+  return Math.floor(hrs / 24) + "d ago";
+}
+
+function renderFilters() {
+  const customers = [];
+  sessions.forEach(function (s) {
+    const c = s.customer_id || "unbound";
+    if (customers.indexOf(c) === -1) customers.push(c);
+  });
+  customers.sort();
+  const bar = document.getElementById("filters");
+  bar.innerHTML = "";
+  const all = el("button", filter === null ? "on" : "", "All (" + sessions.length + ")");
+  all.onclick = function () { filter = null; renderList(); };
+  bar.appendChild(all);
+  customers.forEach(function (c) {
+    const n = sessions.filter(function (s) { return (s.customer_id || "unbound") === c; }).length;
+    const b = el("button", filter === c ? "on" : "", c + " (" + n + ")");
+    b.onclick = function () { filter = c; renderList(); };
+    bar.appendChild(b);
+  });
+}
+
+function renderList() {
+  renderFilters();
+  const box = document.getElementById("items");
+  box.innerHTML = "";
+  const rows = sessions.filter(function (s) {
+    return filter === null || (s.customer_id || "unbound") === filter;
+  });
+  if (!rows.length) { box.appendChild(el("div", "empty", "No conversations yet.")); return; }
+
+  let lastGroup = null;
+  rows.forEach(function (s) {
+    const group = s.customer_id || "No customer bound";
+    if (group !== lastGroup) { box.appendChild(el("div", "grouphead", group)); lastGroup = group; }
+
+    const item = el("div", "item" + (selected === s.session_id ? " on" : ""));
+    item.appendChild(el("div", "id", s.session_id));
+    const meta = el("div", "meta");
+    meta.appendChild(el("span", "", s.turns + (s.turns === 1 ? " turn" : " turns")));
+    meta.appendChild(el("span", "", ago(s.last_seen)));
+    if (s.escalated) meta.appendChild(el("span", "esc", "escalated: " + (s.escalation_reasons[0] || "?")));
+    if (s.blocked_calls) meta.appendChild(el("span", "blk", s.blocked_calls + " blocked"));
+    if (s.redrafts) meta.appendChild(el("span", "blk", s.redrafts + " redrafted"));
+    item.appendChild(meta);
+    item.onclick = function () { selected = s.session_id; renderList(); open(s); };
+    box.appendChild(item);
+  });
+}
+
+async function open(s) {
+  const bar = document.getElementById("sumbar");
+  const pane = document.getElementById("transcript");
+  bar.textContent = "Loading " + s.session_id + "…";
+  pane.innerHTML = "";
+  try {
+    const data = await (await fetch("/session/" + encodeURIComponent(s.session_id))).json();
+    bar.innerHTML = "";
+    [s.session_id, (s.customer_id || "no customer bound"),
+     s.turns + " turns", "mean " + Math.round(s.mean_ms) + " ms",
+     (s.models || []).join(", ")].forEach(function (t) {
+      if (t) bar.appendChild(el("span", "", t));
+    });
+    if (!data.exists) { pane.appendChild(el("div", "empty",
+      "No transcript stored — this session predates message checkpointing, or the store was cleared.")); return; }
+    (data.turns || []).forEach(function (t) {
+      const wrap = el("div", "turn " + (t.role === "user" ? "me" : "bot"));
+      wrap.appendChild(el("div", "who", t.role === "user" ? "Customer" : "Trendly"));
+      wrap.appendChild(el("div", "bubble", t.content));
+      if ((t.tools || []).length) {
+        const row = el("div", "trace");
+        t.tools.forEach(function (c) {
+          const r = c.result || {};
+          if (r.blocked) { row.appendChild(el("span", "chip block", c.tool + " · blocked")); return; }
+          row.appendChild(el("span", r.outcome ? "chip out" : "chip",
+            c.tool + (r.outcome ? " · " + r.outcome : "")));
+        });
+        wrap.appendChild(row);
+      }
+      pane.appendChild(wrap);
+    });
+  } catch (e) {
+    pane.appendChild(el("div", "empty", "Could not load this conversation."));
+  }
+}
+
+async function load() {
+  try {
+    const data = await (await fetch("/sessions")).json();
+    sessions = data.sessions || [];
+  } catch (e) { sessions = []; }
+  renderList();
+}
+load();
 </script></body></html>
 """

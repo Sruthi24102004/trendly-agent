@@ -5,8 +5,12 @@ Guardrails are enforced in code, not just prompted. A blocked call still
 returns a ToolMessage explaining why, so the model self-corrects instead of
 stalling:
 
-1. check_return_eligibility requires a prior successful lookup_order on the
-   same order_id — stops the model inventing an item_id.
+1. check_return_eligibility needs the order established first. This once
+   bounced the call back with "call lookup_order first", but the model would
+   retry the same blocked call and then escalate, so the graph now resolves
+   the order itself. The property that guardrail protected — no invented
+   item_ids — lives in _find_item, which returns the order's real line items
+   rather than guessing at an unrecognised reference.
 2. initiate_return requires a prior check_return_eligibility on the same
    order_id + item_id whose outcome permits action, AND the resolution must
    match that outcome (an exchange_only item cannot be refunded).
@@ -38,7 +42,7 @@ from langgraph.graph.message import add_messages
 from app.cassettes import CassetteLLM
 from app.observability import log_turn
 from app.prompts import SYSTEM_PROMPT
-from app.tools import ALL_TOOLS, _find_order
+from app.tools import ALL_TOOLS, _find_order, customer_profile
 from app.validation import correction_prompt, validate_reply
 
 load_dotenv()
@@ -48,9 +52,8 @@ load_dotenv()
 # .bind_tools() and .invoke(). Swapping providers is a config change, not a
 # code change, which also makes it cheap to fall back when one is rate-limited.
 #
-# Defaults are Gemini 3.6 Flash (better tool-calling reliability and ~17%
-# fewer output tokens than the previous Flash generation) with 3.5 Flash-Lite
-# as the cheap fallback. Set LLM_PROVIDER=groq to switch back.
+# Defaults are Gemini 3.5 Flash-Lite primary with 3.6 Flash behind it; see
+# _DEFAULTS for why that way round. Set LLM_PROVIDER=groq to switch vendors.
 PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 
 _DEFAULTS = {
@@ -105,6 +108,8 @@ def _suggested_retry_seconds(error: Exception) -> float | None:
         if match:
             return float(match.group(1))
     return None
+
+
 _default_primary, _default_fallback = _DEFAULTS.get(PROVIDER, _DEFAULTS["gemini"])
 
 PRIMARY_MODEL = os.environ.get("PRIMARY_MODEL", _default_primary)
@@ -176,13 +181,23 @@ def configure_models(provider: str, primary: str, fallback: str) -> None:
 
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
-# Outcomes from check_return_eligibility that permit initiate_return, mapped
-# to the resolutions each one allows.
 # Tools whose results ground a factual claim. Once one has run, later turns in
 # the same conversation may refer back to what it established.
 GROUNDING_TOOL_NAMES = {
     "search_policy", "lookup_order", "check_return_eligibility",
     "apply_delayed_credit", "initiate_return",
+}
+
+# Outcomes from check_return_eligibility that permit initiate_return, mapped
+# to the resolutions each one allows.
+# Nothing that touches an order may run before the caller has proved who they
+# are. This replaces the earlier "bind to whatever order was mentioned first"
+# scheme, which was a proxy for authentication rather than authentication: it
+# stopped a session from wandering between customers but never established
+# who the first one was.
+ORDER_TOOLS = {
+    "lookup_order", "check_return_eligibility", "initiate_return",
+    "apply_delayed_credit",
 }
 
 ALLOWED_RESOLUTIONS = {
@@ -195,6 +210,7 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     session_customer_id: str | None       # persists — binds session to a customer
     session_grounded: bool                # persists — a grounding tool has run
+    cross_customer_attempts: dict         # persists — {order_id: count}, per order
     looked_up_orders: list[str]           # persists — order_ids seen via lookup_order
     eligibility_outcomes: dict            # persists — "order|item" -> outcome
     consecutive_failures: int             # per turn
@@ -203,7 +219,7 @@ class AgentState(TypedDict):
     iteration: int                        # per turn
     validation_retries: int               # per turn
     last_violations: list                 # per turn — surfaced in diagnostics
-    rejected_drafts: list                 # per turn — [{draft, violations}], for diagnostics/tests
+    rejected_drafts: list                 # per turn — [{draft, violations}] for diagnostics
     model_used: str | None                # per turn — which model answered
     fallback_used: bool                   # per turn
     escalation_reason: str | None         # per turn — why a human was needed
@@ -256,10 +272,12 @@ def agent_node(state: AgentState) -> dict:
     # Two failure modes to survive here:
     #   1. Groq/Llama occasionally emits a raw "<function=name{...}>" string
     #      instead of a structured tool call, which the API rejects.
-    #   2. The free tier's daily token cap returns 429 for the rest of the day.
-    # So: retry the primary with backoff, then try the fallback model, and only
-    # escalate if both are exhausted. A degraded answer beats no answer, and an
-    # honest handoff beats a stack trace.
+    #   2. Rate limits — per-minute request caps on Gemini free tiers (15/min
+    #      on Flash-Lite), per-day token caps on Groq. Both return 429.
+    # So: retry the primary honouring the provider's own suggested delay, then
+    # try the fallback model, which has a separate quota, and only escalate if
+    # both are exhausted. A degraded answer beats no answer, and an honest
+    # handoff beats a stack trace.
     last_error = None
     for model_name, model in (
         (PRIMARY_MODEL, primary_llm),
@@ -319,6 +337,10 @@ def tool_node(state: AgentState) -> dict:
 
     session_customer_id = state.get("session_customer_id")
     session_grounded = bool(state.get("session_grounded"))
+    # Counted per order, not per session. Asking about two different orders
+    # that aren't yours is two questions; asking about the same one twice is
+    # persistence, and only the second deserves a person's time.
+    cross_customer_attempts = dict(state.get("cross_customer_attempts") or {})
     looked_up_orders = set(state.get("looked_up_orders") or [])
     eligibility_outcomes = dict(state.get("eligibility_outcomes") or {})
     consecutive_failures = state.get("consecutive_failures", 0)
@@ -334,23 +356,59 @@ def tool_node(state: AgentState) -> dict:
         tool_call_id = tc["id"]
         result = None
 
-        # --- Guardrail 3: cross-customer access ---
-        if tool_name == "lookup_order":
+        # --- Guardrail 3a: nothing about an order before verification ---
+        if tool_name in ORDER_TOOLS and not session_customer_id:
+            result = _blocked(
+                "the customer has not been verified yet. Ask for the email "
+                "address or phone number on their Trendly account and call "
+                "verify_customer first. Do not reveal anything about any "
+                "order — including whether it exists — until that succeeds.",
+                code="not_verified",
+                customer_message=(
+                    "Before I can pull up any order details, I'll need to check "
+                    "the account. What's the email address or phone number the "
+                    "order was placed with?"
+                ),
+            )
+
+        # --- Guardrail 3b: only that customer's own orders ---
+        if result is None and tool_name == "lookup_order":
             order = _find_order(args.get("order_id", ""))
             if (
                 order
                 and session_customer_id
                 and order["customer_id"] != session_customer_id
             ):
-                result = _blocked(
+                blocked_key = args.get("order_id", "").strip().upper()
+                attempts = cross_customer_attempts.get(blocked_key, 0) + 1
+                cross_customer_attempts[blocked_key] = attempts
+                # Do NOT invite the customer to assert ownership — the agent
+                # has no way to verify a claim, so "let me know if it's yours"
+                # produces a loop: they say yes, it retries, it blocks again.
+                # The only real remedy is a person who can check identity.
+                note = (
                     "this order belongs to a different customer than the one "
                     "in this conversation. Do not confirm it exists, do not "
-                    "describe its contents, and do not say who placed it. "
-                    "Tell the customer you can only discuss orders on their "
-                    "own account.",
+                    "describe its contents, and do not say who placed it. Do "
+                    "not ask the customer to confirm the order is theirs — you "
+                    "cannot verify that. Offer a colleague who can."
+                )
+                if attempts >= 2:
+                    note += (
+                        " They have now asked about THIS order twice, so they "
+                        "are disputing the refusal rather than mistyping. Call "
+                        "escalate_to_human with reason 'customer_dispute' so a "
+                        "person can verify their identity."
+                    )
+                result = _blocked(
+                    note,
+                    code="cross_customer",
+                    attempts=attempts,
                     customer_message=(
-                        "I can only look up orders placed on your own account, "
-                        "so I'm not able to pull that one up."
+                        "I can only see orders placed on the account this "
+                        "conversation is signed in to, so I can't pull that "
+                        "one up. If you think that's a mistake, I can put you "
+                        "through to a colleague who can check it for you."
                     ),
                 )
 
@@ -370,18 +428,22 @@ def tool_node(state: AgentState) -> dict:
                 if order is None:
                     pass  # let the tool return its own order_not_found verdict
                 elif session_customer_id and order["customer_id"] != session_customer_id:
+                    attempts = cross_customer_attempts.get(order_key, 0) + 1
+                    cross_customer_attempts[order_key] = attempts
                     result = _blocked(
                         "this order belongs to a different customer than the "
-                        "one in this conversation.",
+                        "one in this conversation. Do not ask the customer to "
+                        "confirm it is theirs — you cannot verify that.",
+                        code="cross_customer",
+                        attempts=attempts,
                         customer_message=(
-                            "I can only help with orders placed on your own "
-                            "account, so I can't check that one."
+                            "I can only see orders on the account this "
+                            "conversation is signed in to, so I can't check "
+                            "that one. A colleague can verify it if you'd like."
                         ),
                     )
                 else:
                     looked_up_orders.add(order_key)
-                    if session_customer_id is None:
-                        session_customer_id = order["customer_id"]
 
         # --- Guardrail 2: eligibility before action, and matching resolution ---
         if result is None and tool_name == "initiate_return":
@@ -420,14 +482,12 @@ def tool_node(state: AgentState) -> dict:
                     if tool_name in GROUNDING_TOOL_NAMES:
                         session_grounded = True
 
+                    if tool_name == "verify_customer" and result.get("verified"):
+                        # The only way a session becomes bound to a customer.
+                        session_customer_id = result["customer_id"]
+
                     if tool_name == "lookup_order" and result.get("found"):
-                        order_id = args.get("order_id", "").strip().upper()
-                        looked_up_orders.add(order_id)
-                        # First order in the session binds it to that customer.
-                        if session_customer_id is None:
-                            order = _find_order(order_id)
-                            if order:
-                                session_customer_id = order["customer_id"]
+                        looked_up_orders.add(args.get("order_id", "").strip().upper())
 
                     if tool_name == "check_return_eligibility":
                         key = (
@@ -438,6 +498,11 @@ def tool_node(state: AgentState) -> dict:
 
                     if tool_name == "escalate_to_human":
                         escalated = True
+                        # Without this the reason is never captured and every
+                        # model-driven escalation reports None, collapsing the
+                        # dashboard's policy-mandated vs agent-limitation split.
+                        # The tool normalises/infers the value, so trust it.
+                        escalation_reason = result.get("reason") or "unspecified"
 
                 except Exception as e:
                     result = {"error": f"Tool execution failed: {e}"}
@@ -458,6 +523,7 @@ def tool_node(state: AgentState) -> dict:
         "messages": tool_messages,
         "session_customer_id": session_customer_id,
         "session_grounded": session_grounded,
+        "cross_customer_attempts": cross_customer_attempts,
         "looked_up_orders": sorted(looked_up_orders),
         "eligibility_outcomes": eligibility_outcomes,
         "consecutive_failures": consecutive_failures,
@@ -537,8 +603,9 @@ def validate_node(state: AgentState) -> dict:
     codes = [v["code"] for v in violations]
     print(f"[validate_node] rejected reply (attempt {retries + 1}): {codes}")
 
-    # rejected_drafts isn't an Annotated/merged field, so read-then-append
-    # here to keep every draft from this turn, not just the latest.
+    # Keep the rejected text, not just the codes: tuning a false positive is
+    # guesswork without seeing what the model actually wrote. Not an
+    # add_messages field, so read-then-append to retain every draft this turn.
     rejected_drafts = list(state.get("rejected_drafts") or [])
     rejected_drafts.append({"draft": reply, "violations": codes})
 
@@ -627,6 +694,65 @@ graph = graph_builder.compile(checkpointer=checkpointer)
 
 # ---------- ENTRY POINT ----------
 
+def get_session_history(session_id: str) -> dict:
+    """
+    Rebuild a conversation from the checkpointer.
+
+    The graph already persists every message per thread_id, so a browser
+    refresh or a trip to /dashboard should not lose the conversation — the
+    client only needs to remember its session_id and ask for the rest. This
+    also means the transcript survives a server restart, since the
+    checkpointer is on disk.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = graph.get_state(config)
+    values = snapshot.values if snapshot else {}
+    messages = values.get("messages") or []
+
+    turns: list[dict] = []
+    pending_tools: list[dict] = []
+
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            continue
+
+        if isinstance(message, HumanMessage):
+            # The validator's corrective message is a HumanMessage but is not
+            # the customer speaking — it must never appear in a transcript.
+            if (message.additional_kwargs or {}).get("validation_correction"):
+                continue
+            turns.append({"role": "user", "content": _as_text(message.content), "tools": []})
+            pending_tools = []
+            continue
+
+        if isinstance(message, ToolMessage):
+            pending_tools.append({
+                "tool": message.name,
+                "result": _safe_json(_as_text(message.content)),
+            })
+            continue
+
+        # AIMessage: intermediate tool-call turns carry no visible text.
+        text = _as_text(getattr(message, "content", ""))
+        if not text:
+            continue
+        turns.append({"role": "assistant", "content": text, "tools": pending_tools})
+        pending_tools = []
+
+    return {
+        "session_id": session_id,
+        "exists": bool(turns),
+        "turns": turns,
+        "state": {
+            "session_customer_id": values.get("session_customer_id"),
+            "looked_up_orders": values.get("looked_up_orders") or [],
+            "eligibility_outcomes": values.get("eligibility_outcomes") or {},
+            "iterations_this_turn": values.get("iteration", 0),
+            "validation_retries": values.get("validation_retries", 0),
+        },
+    }
+
+
 def run_agent(session_id: str, user_message: str) -> dict:
     config = {"configurable": {"thread_id": session_id}}
     started = time.perf_counter()
@@ -672,7 +798,15 @@ def run_agent(session_id: str, user_message: str) -> dict:
         c["result"]["outcome"] for c in tool_calls_made
         if isinstance(c["result"], dict) and c["result"].get("outcome")
     ]
-    violations = [v["code"] for v in (result.get("last_violations") or [])]
+    # last_violations is cleared when a redraft passes, so reading it alone
+    # logs nothing for exactly the case worth counting: a reply that failed
+    # validation, was redrafted, and then went out correct. rejected_drafts
+    # keeps every failed attempt, so derive the codes from there and fall back
+    # to last_violations for a turn that never got a clean draft.
+    rejected_drafts = result.get("rejected_drafts") or []
+    violations = [code for d in rejected_drafts for code in d.get("violations", [])]
+    if not violations:
+        violations = [v["code"] for v in (result.get("last_violations") or [])]
 
     # Everything the graph is holding for this conversation. Surfaced so the
     # UI can show multi-turn state directly rather than asserting it exists.
@@ -689,12 +823,16 @@ def run_agent(session_id: str, user_message: str) -> dict:
         "latency_ms": latency_ms,
         "blocked_calls": blocked_calls,
         "validation_violations": violations,
-        "rejected_drafts": result.get("rejected_drafts") or [],
+        "rejected_drafts": rejected_drafts,
         "escalation_reason": result.get("escalation_reason"),
     }
 
     log_turn({
         "session_id": session_id,
+        # Recorded so the history browser can group sessions by customer.
+        # A session binds to one customer for its lifetime, so this is stable
+        # once the first order lookup has happened.
+        "customer_id": result.get("session_customer_id"),
         "provider": PROVIDER,
         "model_used": result.get("model_used"),
         "fallback_used": bool(result.get("fallback_used")),

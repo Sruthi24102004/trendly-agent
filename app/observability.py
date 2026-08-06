@@ -27,9 +27,10 @@ _LOCK = threading.Lock()
 # the rest indicate the agent couldn't cope.
 EXPECTED_ESCALATIONS = {
     "lost_parcel_claim",
+    "damaged_item_photos",
     "damaged_within_report_window",
     "cod_bank_details",
-    "out_of_policy_request",
+    "uncovered_policy",
 }
 
 
@@ -139,6 +140,63 @@ def summarize(events: list[dict] | None = None) -> dict:
             "max": round(max(latencies), 1) if latencies else 0.0,
         },
     }
+
+
+def list_sessions(limit: int = 200) -> list[dict]:
+    """
+    One row per conversation, newest first, for the history browser.
+
+    Built from the event log rather than the checkpointer because the log is
+    the thing that knows *when* each turn happened and what it cost; the
+    checkpointer holds the messages and is queried per session on demand.
+    """
+    sessions: dict[str, dict] = {}
+
+    for event in read_events():
+        sid = event.get("session_id")
+        if not sid:
+            continue
+        row = sessions.setdefault(sid, {
+            "session_id": sid,
+            "customer_id": None,
+            "turns": 0,
+            "escalated": 0,
+            "escalation_reasons": [],
+            "blocked_calls": 0,
+            "redrafts": 0,
+            "tools": set(),
+            "models": set(),
+            "first_seen": event.get("ts"),
+            "last_seen": event.get("ts"),
+            "total_ms": 0.0,
+        })
+        row["turns"] += 1
+        # A session binds to a customer partway through, so keep the first
+        # non-null rather than whatever the last turn happened to carry.
+        row["customer_id"] = row["customer_id"] or event.get("customer_id")
+        row["last_seen"] = event.get("ts") or row["last_seen"]
+        row["blocked_calls"] += event.get("blocked_calls", 0)
+        row["redrafts"] += event.get("validation_retries", 0)
+        row["total_ms"] += event.get("latency_ms") or 0
+        row["tools"].update(event.get("tools") or [])
+        if event.get("model_used"):
+            row["models"].add(event["model_used"])
+        if event.get("escalated"):
+            row["escalated"] += 1
+            reason = event.get("escalation_reason") or "unspecified"
+            if reason not in row["escalation_reasons"]:
+                row["escalation_reasons"].append(reason)
+
+    rows = []
+    for row in sessions.values():
+        row["tools"] = sorted(row["tools"])
+        row["models"] = sorted(row["models"])
+        row["mean_ms"] = round(row["total_ms"] / row["turns"], 1) if row["turns"] else 0
+        row.pop("total_ms")
+        rows.append(row)
+
+    rows.sort(key=lambda r: r.get("last_seen") or "", reverse=True)
+    return rows[:limit]
 
 
 def reset() -> None:

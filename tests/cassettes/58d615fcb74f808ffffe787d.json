@@ -1,0 +1,18 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "escalate_to_human",
+      "args": {
+        "order_id": "TR-4526",
+        "reason": "lost_parcel_claim",
+        "summary": "Customer's order TR-4526 (Canvas Tote) was marked lost in transit by Delhivery (30 days past expected delivery). Customer asked what to do. Handing off for free replacement or full refund per lost-parcel policy."
+      },
+      "id": "lHpcNdz8"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "58d615fcb74f808ffffe787d"
+  }
+}

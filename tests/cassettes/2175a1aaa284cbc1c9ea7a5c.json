@@ -1,0 +1,18 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "escalate_to_human",
+      "args": {
+        "summary": "Customer received Pearl Drop Earrings (TR-EAR-042) from order TR-4527 cracked and broken. Delivered 12 days ago (outside the 48-hour damage window). Return eligibility check failed (damage_report_window_expired). Customer wants human agent assistance to review the damaged item.",
+        "order_id": "TR-4527",
+        "reason": "damaged_item_photos"
+      },
+      "id": "44wIpSDY"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "2175a1aaa284cbc1c9ea7a5c"
+  }
+}

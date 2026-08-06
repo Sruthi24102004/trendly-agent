@@ -4,15 +4,15 @@
     {
       "name": "check_return_eligibility",
       "args": {
-        "order_id": "TR-4530",
-        "item_id": "TR-KRT-033",
-        "issue_type": "wrong_size"
+        "order_id": "TR-4529",
+        "item_id": "TR-SCF-027",
+        "issue_type": "change_of_mind"
       },
-      "id": "Nc8LfED2"
+      "id": "XHKTat0s"
     }
   ],
   "_meta": {
     "model": "gemini-3.5-flash-lite",
-    "key": "27b66e000abc02752effad4f"
+    "key": "f6247e82dabef0f9d807b8bc"
   }
 }

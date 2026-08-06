@@ -1,0 +1,8 @@
+{
+  "content": "I'm so sorry about that — I can see that order TR-4526 has been marked as lost in transit by the carrier. \n\nBecause of this, it's treated as a lost-parcel claim rather than a standard delay. I've passed your details to a colleague who will sort out either a free replacement or a full refund (whichever you prefer) within 5 business days. Your reference number is **ESC-TR-4526-05120000**.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "e44675554ad76c4dc15c53f1"
+  }
+}

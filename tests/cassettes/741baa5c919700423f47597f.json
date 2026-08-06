@@ -4,13 +4,13 @@
     {
       "name": "lookup_order",
       "args": {
-        "order_id": "TR-4528"
+        "order_id": "TR-4527"
       },
-      "id": "6zSdIU3s"
+      "id": "l4MNAKl9"
     }
   ],
   "_meta": {
     "model": "gemini-3.5-flash-lite",
-    "key": "9e3991f95014491adebac0a9"
+    "key": "741baa5c919700423f47597f"
   }
 }
