@@ -15,7 +15,7 @@ Outcomes: eligible_refund | exchange_only | not_eligible | escalate
 import json
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -38,10 +38,13 @@ NON_RETURNABLE_CATEGORIES = {
 
 ISSUE_TYPES_DAMAGE = {"damaged", "defective", "wrong_item"}
 
-# In-memory idempotency guard so the ₹250 delay credit can't be issued twice
-# in one process. A real deployment would persist this on the order record —
-# noted as a limitation in SOLUTION.md.
+# In-memory idempotency guards so a side-effecting action can't run twice in
+# one process — a retry, a double-click, or the model calling the tool again
+# after a timeout would otherwise raise a second return or issue a second
+# credit. A real deployment persists these on the order record; noted as a
+# limitation in SOLUTION.md.
 _ISSUED_DELAY_CREDITS: set[str] = set()
+_RAISED_RETURNS: dict[str, dict] = {}
 
 
 def _now() -> datetime:
@@ -377,7 +380,7 @@ def check_return_eligibility(order_id: str, item_id: str, issue_type: str) -> di
             f"I couldn't find an order with the ID {order_id}.",
         )
 
-    item, match_kind = _find_item(order, item_id)
+    item, _ = _find_item(order, item_id)
     if not item:
         return _verdict(
             "not_eligible", "item_not_found",
@@ -528,6 +531,24 @@ def initiate_return(
 
     resolution = (resolution or "refund").strip().lower()
 
+    # Idempotency: one return or exchange per item. Raising a second one
+    # against the same item would create a duplicate pickup and, eventually, a
+    # duplicate refund.
+    idempotency_key = f"{order['order_id']}|{item['sku']}"
+    existing = _RAISED_RETURNS.get(idempotency_key)
+    if existing:
+        return {
+            "success": False,
+            "error": "already_initiated",
+            "return_id": existing["return_id"],
+            "type": existing["type"],
+            "customer_message": (
+                f"There's already a {existing['label']} open for your "
+                f"{item['name']} — reference {existing['return_id']}. "
+                "It doesn't need raising again; the pickup details are on their way."
+            ),
+        }
+
     if resolution == "exchange":
         if not new_size:
             return {
@@ -535,6 +556,11 @@ def initiate_return(
                 "error": "missing_size",
                 "customer_message": "Which size would you like instead?",
             }
+        _RAISED_RETURNS[idempotency_key] = {
+            "return_id": f"EXC-{order['order_id']}-{item['sku']}",
+            "type": "size_exchange",
+            "label": "size exchange",
+        }
         return {
             "success": True,
             "return_id": f"EXC-{order['order_id']}-{item['sku']}",
@@ -558,6 +584,11 @@ def initiate_return(
     }
     timeline = timelines.get(payment_method, "per the timelines in our refund policy")
 
+    _RAISED_RETURNS[idempotency_key] = {
+        "return_id": f"RET-{order['order_id']}-{item['sku']}",
+        "type": "refund_return",
+        "label": "return",
+    }
     result = {
         "success": True,
         "return_id": f"RET-{order['order_id']}-{item['sku']}",

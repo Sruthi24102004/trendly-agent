@@ -14,11 +14,14 @@ stalling:
 2. initiate_return requires a prior check_return_eligibility on the same
    order_id + item_id whose outcome permits action, AND the resolution must
    match that outcome (an exchange_only item cannot be refunded).
-3. Session-scoped customer binding: the first order looked up in a session
-   binds that session to its customer. Any later lookup of an order belonging
-   to a different customer is refused in code. Prompt Rule 4 alone did not
-   hold — the model disclosed another customer's order contents when asked
-   directly, so this moved into the graph.
+3. Verification gates every order tool. The customer proves who they are with
+   the email or phone on the account, and only a successful verify_customer
+   can bind a session; after that, another customer's order is refused in
+   code. This replaced an earlier scheme that bound the session to whichever
+   order was mentioned first — that stopped a conversation wandering between
+   customers but never established who the first one was. Prompt rules alone
+   did not hold here: the model disclosed another customer's order contents
+   when asked directly, which is why the check lives in the graph.
 
 Also handles consecutive tool-failure recovery, malformed tool-call retry
 with backoff, and max-iteration escalation. State persists per session via
@@ -179,6 +182,7 @@ def configure_models(provider: str, primary: str, fallback: str) -> None:
     primary_llm = _build_llm(primary)
     fallback_llm = _build_llm(fallback)
 
+
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
 # Tools whose results ground a factual claim. Once one has run, later turns in
@@ -188,8 +192,6 @@ GROUNDING_TOOL_NAMES = {
     "apply_delayed_credit", "initiate_return",
 }
 
-# Outcomes from check_return_eligibility that permit initiate_return, mapped
-# to the resolutions each one allows.
 # Nothing that touches an order may run before the caller has proved who they
 # are. This replaces the earlier "bind to whatever order was mentioned first"
 # scheme, which was a proxy for authentication rather than authentication: it
@@ -200,6 +202,8 @@ ORDER_TOOLS = {
     "apply_delayed_credit",
 }
 
+# Outcomes from check_return_eligibility that permit initiate_return, mapped
+# to the resolutions each one allows.
 ALLOWED_RESOLUTIONS = {
     "eligible_refund": {"refund", "exchange"},
     "exchange_only": {"exchange"},
@@ -763,9 +767,10 @@ def run_agent(session_id: str, user_message: str) -> dict:
     result = graph.invoke(
         {
             "messages": [HumanMessage(content=user_message)],
-            # Per-turn counters reset; session_customer_id, looked_up_orders
-            # and eligibility_outcomes are deliberately not passed here so the
-            # checkpointer preserves them across the conversation.
+            # Per-turn counters reset here. The conversation-scoped keys —
+            # session_customer_id, session_grounded, cross_customer_attempts,
+            # looked_up_orders, eligibility_outcomes — are deliberately absent
+            # so the checkpointer carries them forward untouched.
             "iteration": 0,
             "consecutive_failures": 0,
             "last_failed_tool": None,
@@ -830,8 +835,8 @@ def run_agent(session_id: str, user_message: str) -> dict:
     log_turn({
         "session_id": session_id,
         # Recorded so the history browser can group sessions by customer.
-        # A session binds to one customer for its lifetime, so this is stable
-        # once the first order lookup has happened.
+        # Null until verify_customer succeeds, then stable for the rest of the
+        # conversation — a session belongs to one customer for its lifetime.
         "customer_id": result.get("session_customer_id"),
         "provider": PROVIDER,
         "model_used": result.get("model_used"),
