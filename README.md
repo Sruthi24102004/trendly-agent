@@ -1,146 +1,225 @@
 # Trendly Support Agent
 
 A tool-calling support agent for Trendly, a direct-to-consumer fashion
-retailer. Handles order status, policy questions, and return/exchange
-eligibility end to end, and hands the rest to a human cleanly. Built on
-LangGraph with real function calling (not keyword matching), a rule-based
-reply validator that checks every draft against what actually happened
-before it reaches the customer, and cassette-based offline testing so the
-full scenario suite runs without an API key.
+retailer. It handles order status, returns, exchanges, refunds and policy
+questions across multi-turn conversations, and hands off to a human when it
+should — with a summary a person can actually act on.
 
-See [`SOLUTION.md`](./SOLUTION.md) for architecture and trade-offs, and
-[`PROMPTS.md`](./PROMPTS.md) for how the prompts and guardrails were
-iterated on, with real before/after examples from bugs this project
-actually produced and fixed.
+Built on LangGraph with real function calling. The design principle
+throughout: **decisions live in code, not in the prompt.** The model chooses
+which tool to call and how to phrase the answer; every policy verdict, every
+precondition and every refusal is enforced in the graph, where it can be
+tested without an API key.
+
+---
 
 ## Quick start
 
-**Requirements:** Python 3.12+, and a free API key from either
-[Groq](https://console.groq.com/keys) or
-[Google AI Studio](https://aistudio.google.com/apikey) (Gemini).
-
 ```bash
-git clone <this-repo-url>
+git clone <your-repo-url>
 cd trendly-agent
+
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env             # then fill in your API key
+
+cp .env.example .env               # then add your API key
 uvicorn app.main:app --reload
 ```
 
-The chat UI is at `http://localhost:8000/` — a live view of the graph's
-session state (looked-up orders, eligibility decisions, model used,
-blocked guardrail calls) sits alongside the conversation, plus preset
-scenario buttons for a quick walkthrough. `/dashboard` shows aggregated
-metrics once some turns have run.
+Open <http://127.0.0.1:8000>.
 
-`start.sh` does the install + launch in one command if you'd rather not
-set up the venv manually:
+A free Gemini key from [Google AI Studio](https://aistudio.google.com/apikey)
+is enough. Groq works too — set `LLM_PROVIDER=groq`.
+
+**You can run the whole test suite without any API key.** See
+[Testing](#testing).
+
+---
+
+## Configuration
+
+Only `GEMINI_API_KEY` is required. Everything else has a working default.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LLM_PROVIDER` | `gemini` | `gemini` or `groq` |
+| `GEMINI_API_KEY` | — | Google AI Studio key (`GOOGLE_API_KEY` also accepted) |
+| `GROQ_API_KEY` | — | Only needed when `LLM_PROVIDER=groq` |
+| `PRIMARY_MODEL` | `gemini-3.5-flash-lite` | Main model |
+| `FALLBACK_MODEL` | `gemini-3.6-flash` | Used when the primary is rate-limited |
+| `GEMINI_THINKING_LEVEL` | `medium` | Flash-Lite's `minimal` default causes premature tool termination |
+| `TRENDLY_NOW` | unset | Freezes "today" so return-window outcomes stay stable |
+| `MIN_MODEL_INTERVAL_MS` | `0` | Minimum gap between model calls; scripted runs set 4500 |
+| `MAX_RETRY_WAIT_S` | `12` | Cap on honouring a provider's suggested retry delay |
+| `ADMIN_TOKEN` | unset | Guards the operator routes; unset means localhost-only |
+| `CASSETTE_MODE` | `off` | `record` / `replay` / `auto` for offline conversation tests |
+| `EVENT_LOG` | `logs/events.jsonl` | Where turn-level telemetry is written |
+| `SESSIONS_DB` | `sessions.db` | LangGraph checkpoint store |
+
+**A note on `TRENDLY_NOW`.** `orders.json` was authored with fixed distances
+from "today" — TR-4523 is annotated *"well outside the 30-day window"*. Left
+on real time, TR-4522 leaves the return window on 13 August and TR-4528 on 18
+August, silently changing what the scenarios demonstrate. Setting
+`TRENDLY_NOW=2026-08-05T12:00:00Z` preserves the cases the dataset was built
+to exercise. Remove it for real behaviour.
+
+---
+
+## Endpoints
+
+**Customer-facing**
+
+| Route | Purpose |
+|---|---|
+| `GET /` | Chat interface |
+| `POST /chat` | `{session_id, message}` → reply, tool calls, state |
+| `GET /health` | Liveness. Returns `{"status":"ok"}` and nothing more to a customer |
+| `GET /session/{id}` | Replays a conversation so the page survives a refresh |
+| `GET /session/{id}/customer` | The signed-in customer's own profile and orders |
+
+**Operator-facing** — every conversation across all customers, so these are
+gated. With `ADMIN_TOKEN` unset they answer local requests only and 404
+elsewhere; with it set, a matching token is required via `X-Admin-Token`,
+`?token=…`, or the cookie the page sets on first use. 404 rather than 403, so
+an unauthenticated caller doesn't learn the surface exists.
+
+| Route | Purpose |
+|---|---|
+| `GET /dashboard` | Deflection rate, escalation split, guardrail activity, latency |
+| `GET /history` | Every session, grouped by customer, with full transcripts |
+| `GET /metrics` | The same numbers as JSON |
+| `GET /sessions` | Session index |
+
+The customer page links to none of them, and a test asserts it.
+
+---
+
+## Testing
+
+Two layers, deliberately separated. When something fails you want to know
+immediately whether the **rules** are wrong or the **model** is.
+
+**Offline — no API key, no network, about a second**
+
 ```bash
-PORT=8000 ./start.sh
+pytest tests/test_tools_unit.py tests/test_guardrails_unit.py \
+       tests/test_verification.py tests/test_admin_routes.py -v
 ```
 
-### `.env` reference
+Every policy branch against every order in the dataset, the reply validator,
+contact matching and the verification gate, and the admin routes.
 
-```dotenv
-LLM_PROVIDER=gemini              # "gemini" or "groq" — both free-tier
-GEMINI_API_KEY=...
-GROQ_API_KEY=...
-PRIMARY_MODEL=gemini-3.5-flash-lite
-FALLBACK_MODEL=gemini-3.6-flash
-TRENDLY_NOW=2026-08-05T12:00:00Z # freezes "today" so return-window outcomes
-                                  # (30 days, 48-hour damage window, etc.)
-                                  # stay stable instead of drifting daily
-GEMINI_THINKING_LEVEL=medium
-```
-
-## Running the tests
-
-Two layers, deliberately separated by speed and cost:
+**End-to-end runner**
 
 ```bash
-# Offline, deterministic, no API key — decision logic + the reply validator
-pytest tests/test_tools_unit.py tests/test_guardrails_unit.py -v
-
-# Live scripted conversations against the real agent graph
-pytest -m llm -v -s
+python -m scripts.e2e            # stages 1 and 2 — free
+python -m scripts.e2e --live     # adds the conversations
 ```
 
-The second command needs `CASSETTE_MODE` set. `record` hits the real model
-once and saves every response as a cassette under `tests/cassettes/`;
-`replay` reruns the same suite offline, free, and deterministically from
-those recordings — this is how a reviewer runs the full suite without an
-API key, once cassettes are committed:
+Stage 1 runs the offline suites. Stage 2 checks the HTTP surface: route
+gating, data exposure at the tool boundary, and that the verification gate and
+single session-binding path exist *as code*, by inspecting the graph. Stage 3
+runs twelve scripted conversations and is opt-in because it spends quota.
+
+**Live scenarios**
 
 ```bash
-CASSETTE_MODE=record pytest -m llm -v      # first time, or after a prompt/logic change
-CASSETTE_MODE=replay pytest -m llm -v -s   # every time after
+pytest tests/test_scenarios.py -v
 ```
 
-`-s` matters for the second layer — without it, pytest only shows the
-per-turn trace (customer message → tools that ran → agent's reply) for
-tests that *fail*. With it, every test prints its trace regardless of
-pass/fail, so you can read straight through and see exactly what the agent
-did on every scripted conversation, not just the ones that broke.
+Paced at 4.5s between model calls, because free Gemini tiers cap requests per
+*minute* (15 on Flash-Lite). Without pacing the run collapses into 429s and
+every assertion fails against a "model unavailable" escalation — a false red
+as misleading as a false green.
 
-For a plain-English read-through instead of pytest output:
-```bash
-python -m scripts.demo --cassettes auto
-```
-
-## Other useful commands
+**Cassettes — run the live suite without a key**
 
 ```bash
-python -m scripts.ab_compare --cassettes replay    # compare model configs on the same scenarios
-python -m scripts.demo --list                      # see available demo conversations
+CASSETTE_MODE=record pytest tests/test_scenarios.py   # once, with a key
+CASSETTE_MODE=replay pytest tests/test_scenarios.py   # thereafter, free
 ```
 
-## Deploying / live endpoint
+Model calls are recorded to `tests/cassettes/` and replayed. This is what CI
+runs.
 
-This runs anywhere that can run `uvicorn app.main:app`. No deployment
-config (Dockerfile, Procfile, etc.) is committed yet — **this is a known
-gap, not an oversight**: pick a target and add it before submitting if a
-live URL is required, rather than the repo-runs-in-one-command fallback the
-brief also accepts (`./start.sh` after `.env` is filled in).
+**Reading conversations rather than assertions**
 
-## AI usage note
+```bash
+python -m scripts.demo --list
+python -m scripts.demo --only happy_path final_sale
+```
 
-Built with Claude assisting throughout — drafting tool docstrings and
-guardrail logic, reasoning through edge cases, writing and running tests,
-and helping fix bugs the tests surfaced. Architectural decisions (what each
-guardrail enforces, what a tool's contract looks like, which failures were
-worth locking in as regression tests) were mine, and every fix was verified
-before being accepted — either against the real model or by isolating the
-exact logic and running it directly. `PROMPTS.md` documents specific
-examples of this iteration, including a validator bug found by reasoning
-through an untested case (multi-item requests) rather than from a bug
-report.
+Prints transcripts with tool calls, guardrail blocks and validation results
+inline. Pass/fail tells you whether the agent is correct; this tells you
+whether it sounds like support worth deploying.
 
-## Repo layout
+**Comparing models**
+
+```bash
+python -m scripts.ab_compare --cassettes replay
+```
+
+Same scenarios across model configurations, with pass rate, escalation rate
+and latency side by side.
+
+---
+
+## Layout
 
 ```
 app/
-  main.py          FastAPI surface: /chat, /health, /metrics, /dashboard, /
-  agent.py          LangGraph: agent_node, tool_node (guardrails), validate_node
-  tools.py          The 6 tools: lookup_order, search_policy,
-                     check_return_eligibility, initiate_return,
-                     apply_delayed_credit, escalate_to_human
-  validation.py     Rule-based reply checks run before a draft reaches the customer
-  policy_store.py   Keyword + synonym-map retrieval over trendly_policy.md
-  cassettes.py      Record/replay for offline, deterministic, free testing
-  observability.py  Turn-by-turn JSONL logging + /metrics aggregation
-  prompts.py        The system prompt
-data/
-  orders.json           10 fixed orders (provided, loaded as-is)
-  trendly_policy.md     Shipping & returns policy (provided, sole source of truth)
+  agent.py          LangGraph graph, guardrails, retry and fallback
+  tools.py          Seven tools; all policy logic lives here
+  prompts.py        System prompt (see PROMPTS.md for how it got there)
+  policy_store.py   Policy retrieval over trendly_policy.md
+  validation.py     Reply validation — what the agent may *say*
+  observability.py  Turn-level event log and metric aggregation
+  cassettes.py      Record/replay for model calls
+  main.py           FastAPI routes, customer UI, operator UI
 scripts/
-  demo.py           Curated conversation transcripts, for reading not asserting
-  ab_compare.py     Same scenarios across model configs, side by side
-tests/
-  test_tools_unit.py       Decision logic, offline, no model calls
-  test_guardrails_unit.py  Reply validator, offline, no model calls
-  test_scenarios.py        Scripted multi-turn conversations against /chat
-  cassettes/               Recorded model responses for offline replay
-.github/workflows/tests.yml  CI: unit+guardrails always, scenarios via cassette replay
+  demo.py           Conversation transcripts for reading
+  e2e.py            Three-stage end-to-end runner
+  ab_compare.py     Provider/model comparison
+tests/              Four offline suites plus the live scenario suite
+data/               orders.json and trendly_policy.md, unmodified
 ```
+
+---
+
+## Known constraints
+
+- **Free-tier rate limits.** Flash-Lite allows 15 requests/minute, 3.6 Flash
+  20/day. A turn costs 2–6 model calls. Scripted runs set
+  `MIN_MODEL_INTERVAL_MS`; the agent honours the provider's own suggested
+  retry delay and falls back to the other model, which has a separate quota.
+- **Verification is identification, not authentication.** Knowing an email is
+  enough to open an account. Real deployment needs an OTP or a session token
+  from an already-signed-in app. Discussed in SOLUTION.md.
+- **In-memory idempotency.** Duplicate returns and delay credits are blocked
+  per process, not persisted.
+
+---
+
+## AI usage
+
+Claude was used heavily and directly, mostly as a reviewer and pair on this
+codebase rather than a code generator working from a blank page.
+
+**Written by me:** the original architecture and tool design, the LangGraph
+graph structure, the guardrail concept, the first scenario suite, the
+idempotency guard on `initiate_return`, the CI workflow, the prompt-injection
+and retrieval-robustness tests, multi-item scenarios, verbose test tracing,
+and the rejected-draft visibility in diagnostics. I also found the multi-item
+mixed-outcome bug in the reply validator.
+
+**Generated by Claude, reviewed and integrated by me:** the eligibility
+verdict shape (`outcome` + `customer_message`), the policy retrieval rewrite,
+item-reference matching, most of the current system prompt, the Gemini
+migration, reply validation, cassettes, observability, the dashboard and
+history browser, the verification gate, admin gating, and the e2e runner.
+
+Every generated change was reviewed, run against the test suites, and in
+several cases corrected — a few are documented in PROMPTS.md, including two
+where a "fix" silently no-oped and only a failing test caught it. I can
+explain and modify any part of this.

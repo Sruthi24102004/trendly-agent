@@ -133,6 +133,30 @@ def session(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/demo/contacts", dependencies=[Depends(require_admin)])
+def demo_contacts():
+    """
+    The seeded accounts, for switching between them quickly during
+    evaluation. Admin-gated like the other operator routes: locally it just
+    works, and on a deployed host without a token it 404s, so a real customer
+    can never enumerate the customer list. The chat page hides the switcher
+    when this returns anything other than 200.
+    """
+    from app.tools import _load_data
+
+    return {
+        "contacts": [
+            {
+                "customer_id": c["customer_id"],
+                "name": c["name"],
+                "first_name": c["name"].split()[0],
+                "email": c["email"],
+            }
+            for c in _load_data()["customers"]
+        ]
+    }
+
+
 @app.get("/session/{session_id}/customer")
 def session_customer(session_id: str):
     """
@@ -262,6 +286,17 @@ CHAT_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
   .send:hover:not(:disabled) { transform:translateY(-1px); }
   .send:disabled { opacity:.4; cursor:default; }
 
+  .switcher { display:none; gap:6px; align-items:center; overflow-x:auto;
+    padding:8px 10px; }
+  .switcher.on { display:flex; }
+  .switcher .lbl { flex:none; font-size:10px; letter-spacing:.11em;
+    text-transform:uppercase; color:var(--dim); font-weight:600; margin-right:2px; }
+  .switcher button { flex:none; padding:5px 11px; font-size:11.5px; cursor:pointer;
+    border-radius:999px; border:1px solid var(--line); background:var(--panel-2);
+    color:var(--muted); white-space:nowrap; transition:all .15s; }
+  .switcher button:hover { color:var(--accent); border-color:var(--accent-dim); }
+  .switcher button.on { color:var(--accent); border-color:var(--accent-dim); }
+
   .quick { display:flex; gap:6px; overflow-x:auto; padding-bottom:2px; }
   .quick button { flex:none; padding:6px 12px; font-size:11.5px; cursor:pointer;
     border-radius:999px; border:1px solid var(--line); background:var(--panel);
@@ -316,12 +351,14 @@ CHAT_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
     </div>
     <div class="spacer"></div>
     <div class="badge" id="status-badge"><span class="dot"></span>Online</div>
+    <button class="badge btn" id="switch-account" title="Sign in as a different account">Switch account</button>
     <button class="badge btn" id="end-session" title="Clears this conversation">End chat</button>
   </header>
 
   <div class="main">
     <div class="chatcol">
       <div class="card" id="chat"></div>
+      <div class="card switcher" id="switcher"></div>
       <div class="quick" id="quick"></div>
       <div class="card composer">
         <input type="text" id="input" placeholder="Type your message…" autofocus />
@@ -334,7 +371,7 @@ CHAT_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 
 <script>
 const SESSION_KEY = "trendly.session";
-let sessionId, verified = false;
+let sessionId, verified = false, boundCustomer = null;
 const chat = document.getElementById("chat");
 const input = document.getElementById("input");
 const button = document.getElementById("send");
@@ -374,6 +411,43 @@ function renderQuick() {
     b.onclick = function () { input.value = q[1]; send(); };
     box.appendChild(b);
   });
+}
+
+// Evaluation affordance: one click to start a fresh session signed in as any
+// seeded account. Hidden entirely when /demo/contacts isn't reachable, which
+// is the case on a deployed host without an admin token.
+let contacts = [];
+
+async function loadSwitcher() {
+  const bar = document.getElementById("switcher");
+  try {
+    const res = await fetch("/demo/contacts");
+    if (!res.ok) return;
+    contacts = (await res.json()).contacts || [];
+  } catch (e) { return; }
+  if (!contacts.length) return;
+
+  bar.classList.add("on");
+  renderSwitcher();
+}
+
+function renderSwitcher() {
+  const bar = document.getElementById("switcher");
+  bar.innerHTML = "";
+  bar.appendChild(el("div", "lbl", "Sign in as"));
+  contacts.forEach(function (c) {
+    const b = el("button", boundCustomer === c.customer_id ? "on" : "",
+                 c.first_name + " · " + c.customer_id);
+    b.title = c.email;
+    b.onclick = function () { signInAs(c); };
+    bar.appendChild(b);
+  });
+}
+
+function signInAs(contact) {
+  newSession("Starting a new conversation as " + contact.name + ".");
+  input.value = "Hi, my email is " + contact.email;
+  send();
 }
 
 function welcome() {
@@ -460,18 +534,22 @@ async function refreshSide() {
     if (p.verified) {
       const was = verified;
       verified = true;
+      boundCustomer = p.customer_id;
       renderCustomer(p);
       if (!was) renderQuick();
     } else {
       verified = false;
+      boundCustomer = null;
       lockedPanel();
     }
+    if (contacts.length) renderSwitcher();
   } catch (e) { lockedPanel(); }
 }
 
 function newSession(note) {
   sessionId = "s-" + Math.random().toString(36).slice(2, 10);
   verified = false;
+  boundCustomer = null;
   try { sessionStorage.setItem(SESSION_KEY, sessionId); } catch (e) {}
   chat.innerHTML = "";
   if (note) chat.appendChild(el("div", "note", note));
@@ -519,6 +597,19 @@ async function send() {
   }
 }
 
+document.getElementById("switch-account").onclick = function () {
+  if (contacts.length) {
+    // The switcher strip is already on screen; nudge toward it.
+    newSession("Pick an account below to sign in as.");
+    input.focus();
+    return;
+  }
+  newSession("Starting a new conversation.");
+  addTurn("Trendly", "Sure — what's the email address or phone number on the " +
+    "account you'd like to use?", "bot");
+  input.focus();
+};
+
 document.getElementById("end-session").onclick = function () {
   if (!chat.querySelector(".turn")) return;
   addTurn("Trendly", "Thanks for chatting with us. This conversation is now " +
@@ -553,6 +644,7 @@ async function restore() {
   } catch (e) { welcome(); }
   refreshSide();
 }
+loadSwitcher();
 restore();
 </script></body></html>
 """

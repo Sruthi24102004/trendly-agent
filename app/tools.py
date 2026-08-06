@@ -15,7 +15,7 @@ Outcomes: eligible_refund | exchange_only | not_eligible | escalate
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -29,6 +29,65 @@ DAMAGE_REPORT_HOURS = 48         # policy 6.1
 DELAY_THRESHOLD_DAYS = 3         # policy 1.5
 FOOTWEAR_NO_BOX_DEDUCTION = 300  # policy 2.5
 DELAY_CREDIT_AMOUNT = 250        # policy 1.5
+
+# Support hours, from the footer of the policy document.
+IST = timezone(timedelta(hours=5, minutes=30))
+SUPPORT_OPEN_HOUR = 9
+SUPPORT_CLOSE_HOUR = 21
+
+
+def _wall_now() -> datetime:
+    """
+    Real wall-clock time, deliberately ignoring TRENDLY_NOW.
+
+    Two different clocks live in this system and conflating them was a bug.
+    TRENDLY_NOW freezes "today" so the fixed dataset's return windows stay
+    stable — TR-4523 is meant to be outside the 30-day window forever. Support
+    hours have nothing to do with the dataset: whether a colleague is at their
+    desk is a fact about the actual present moment. Reading the frozen clock
+    made the agent cheerfully promise "we're open until 9 PM IST" at 3 AM.
+
+    SUPPORT_NOW overrides this, for testing the closed-hours path.
+    """
+    override = os.environ.get("SUPPORT_NOW")
+    if override:
+        return datetime.fromisoformat(override.replace("Z", "+00:00"))
+    return datetime.now(timezone.utc)
+
+
+def support_status() -> dict:
+    """
+    Whether a human is reachable right now, in IST.
+
+    An escalation that promises someone "will be in touch shortly" at 11 PM is
+    a small lie that costs trust the moment it isn't. Computed from the clock
+    rather than stated in the prompt, so the agent can't get it wrong.
+    """
+    now_ist = _wall_now().astimezone(IST)
+    open_now = SUPPORT_OPEN_HOUR <= now_ist.hour < SUPPORT_CLOSE_HOUR
+
+    if open_now:
+        closes = now_ist.replace(hour=SUPPORT_CLOSE_HOUR, minute=0, second=0, microsecond=0)
+        hours_left = (closes - now_ist).total_seconds() / 3600
+        when = (
+            "shortly — we're open until 9 PM IST"
+            if hours_left >= 1
+            else "shortly, though we close at 9 PM IST tonight"
+        )
+    else:
+        opening_today = now_ist.hour < SUPPORT_OPEN_HOUR
+        when = (
+            "when we open at 9 AM IST this morning"
+            if opening_today
+            else "when we open at 9 AM IST tomorrow"
+        )
+
+    return {
+        "open_now": open_now,
+        "local_time_ist": now_ist.strftime("%H:%M on %d %b %Y"),
+        "when_they_will_be_in_touch": when,
+        "hours": "9:00 AM – 9:00 PM IST, seven days a week",
+    }
 
 # policy 2.3 — matched against the `category` field in orders.json
 NON_RETURNABLE_CATEGORIES = {
@@ -729,7 +788,7 @@ def escalate_to_human(summary: str, reason: str = "", order_id: str = "") -> dic
     `reason` must be one of: lost_parcel_claim, damaged_item_photos,
     cod_bank_details, uncovered_policy, customer_dispute, out_of_scope_request,
     tool_failure. Always pass it — it is what routes the ticket."""
-    ticket_id = f"ESC-{order_id or 'GEN'}-{_now().strftime('%d%H%M%S')}"
+    ticket_id = f"ESC-{order_id or 'GEN'}-{_wall_now().strftime('%d%H%M%S')}"
 
     # Attach the order snapshot so the human doesn't repeat the lookup. This
     # is the difference between a ticket someone can action and a ticket
@@ -754,16 +813,26 @@ def escalate_to_human(summary: str, reason: str = "", order_id: str = "") -> dic
     if reason not in ESCALATION_REASONS:
         reason = _infer_reason(order)
 
+    support = support_status()
+    if support["open_now"]:
+        timing = f"They'll be in touch {support['when_they_will_be_in_touch']}."
+    else:
+        timing = (
+            f"Our team is offline at the moment (it's "
+            f"{support['local_time_ist']} here), so they'll pick this up "
+            f"{support['when_they_will_be_in_touch']}."
+        )
+
     return {
         "escalated": True,
         "ticket_id": ticket_id,
         "reason": reason,
         "summary_for_agent": summary,
         "order_context": context,
+        "support": support,
         "customer_message": (
             f"I've passed this to a colleague who can help — your reference is "
-            f"{ticket_id}. They'll be in touch during support hours, 9 AM to "
-            "9 PM IST, seven days a week."
+            f"{ticket_id}. {timing}"
         ),
     }
 

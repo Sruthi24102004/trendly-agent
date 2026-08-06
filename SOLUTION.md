@@ -1,162 +1,191 @@
-# Solution Note
+# Solution note
 
 ## Architecture
 
+A LangGraph state machine with four nodes and seven tools. State persists per
+session in SQLite, so a conversation survives a page refresh or a server
+restart.
+
 ```
-customer message
-      |
-      v
- +----------+     tool calls      +-----------+
- | agent_node| ------------------> | tool_node |
- | (LLM +    |                     | (guardrails|
- |  tools)   | <------------------ |  + tools) |
- +----------+     tool results     +-----------+
-      |
-      | draft reply
-      v
- +--------------+   violations   +------------------+
- | validate_node| -------------> | correction retry |
- |  (rule-based |                | (1x) then        |
- |   checks)    | -- clean ----> | escalate_to_human|
- +--------------+                +------------------+
-      |
-      v
- reply to customer
+                    ┌──────────┐
+   customer ───────▶│  agent   │──── tool calls ────▶┌───────┐
+                    │  (model) │◀─── tool results ───│ tools │
+                    └────┬─────┘                     └───┬───┘
+                         │ no tool calls                 │ guardrails
+                         ▼                               │ blocked → reason
+                    ┌──────────┐                         │ fed back
+                    │ validate │── clean ──▶ customer    │
+                    │  (reply) │── rejected ──▶ redraft ─┘
+                    └────┬─────┘── twice ──▶ escalate
+                         │
+                    ┌────▼──────────┐
+                    │force_escalate │  tool failures, step limit
+                    └───────────────┘
 ```
 
-Built on LangGraph. Session state (`session_customer_id`,
-`looked_up_orders`, `eligibility_outcomes`, `session_grounded`) persists
-across turns via the checkpointer; per-turn counters
-(`iteration`, `validation_retries`, `consecutive_failures`) reset each turn.
+**Tools.** `verify_customer`, `lookup_order`, `search_policy`,
+`check_return_eligibility`, `initiate_return`, `apply_delayed_credit`,
+`escalate_to_human`.
 
-**Six tools**, each returning a single unambiguous `outcome` plus a
-pre-written `customer_message` (see `PROMPTS.md` §1 for why): `lookup_order`,
-`search_policy`, `check_return_eligibility`, `initiate_return`,
-`apply_delayed_credit`, `escalate_to_human`.
+**The organising idea: decisions in code, wording from the model.** Every
+policy verdict is computed in `tools.py` and returned as an `outcome` plus a
+`customer_message` the model reuses. Every precondition is enforced in the
+graph. The model chooses which tool to call and adapts tone — nothing else.
 
-**Three enforcement layers**, deliberately not relying on any one of them
-alone:
-1. **Tool contracts** — the tool decides and explains; the model routes.
-2. **`tool_node` guardrails** — code-level, not prompt-level: cross-customer
-   lookups are blocked by comparing `session_customer_id` against the
-   order's real owner; `initiate_return` is refused unless
-   `check_return_eligibility` ran for that exact order+item this session and
-   the requested resolution matches what the outcome actually permits
-   (`ALLOWED_RESOLUTIONS = {"eligible_refund": {refund, exchange},
-   "exchange_only": {exchange}}`). A final-sale refund attempt is refused in
-   code, not just discouraged in the prompt — verified by
-   `test_final_sale_refund_blocked_in_code`, which explicitly asks for one.
-3. **`validate_node`** — catches what the first two can't: the model
-   describing a correct decision incorrectly in English. Checks the drafted
-   reply against the turn's actual tool results before the customer sees it
-   (contradiction, unsupported action claim, ungrounded policy figure,
-   cross-customer name leak, solicited bank details, invented discount). One
-   corrective redraft, then escalate rather than send a reply known to be
-   wrong.
+The evidence for that split is in the failure history: every wrong answer this
+project produced came from the model *describing* a correct verdict
+incorrectly, and every fix that stuck moved a decision out of the prompt. The
+one that makes the point best: on a lost parcel, the model reached for the
+delay credit — the order genuinely is 30 days late, so the arithmetic invites
+it — and the tool refused and routed to the claim path instead. Prompt said
+one thing, model tried another, code decided.
 
-**Testing**: `tests/test_tools_unit.py` and `test_guardrails_unit.py` cover
-decision logic and the validator offline, deterministically, in under a
-second — no model calls. `tests/test_scenarios.py` runs ~27 scripted
-multi-turn conversations against the live `/chat` endpoint. Cassette
-record/replay (`app/cassettes.py`) means these run free and offline for a
-reviewer once recorded — real model responses fingerprinted on the model
-name + full message history, so an edit anywhere in that history invalidates
-the cassette rather than silently serving a stale one.
-`scripts/ab_compare.py` runs the same scenario set across model
-configurations to answer "which model should this run on?" with evidence
-from Trendly's own data rather than a general leaderboard.
+---
 
-## Key trade-offs
+## Key decisions and trade-offs
 
-**Policy retrieval is keyword + hand-tuned synonym matching, not
-embeddings.** For a single, short, static policy document, embeddings are
-disproportionate engineering for the actual retrieval problem, and keyword
-matching is trivially debuggable — you can read exactly why a query matched
-or didn't. The real risk is coverage: a customer phrasing that shares no
-words with the doc and isn't in the synonym map. Tested this directly
-against phrasings not literally in the map ("will I get my money back to my
-wallet" → correctly finds Refunds) and confirmed the failure mode is safe —
-an ambiguous case ("courier never shows up") returns `NOT FOUND` rather than
-guessing a wrong section. This would not scale to a real multi-page policy
-catalog; embeddings become the right call well before that point.
+**Verdict + message, not a verdict alone.** Returning
+`{"eligible": true, "exchange_only": true}` let the model pick a field and
+guess; it told a customer a final-sale item was "not eligible for return".
+Returning one `outcome` and the sentence to say fixed it. *Trade-off:* replies
+are more uniform and less conversational than a free-running model would
+produce. For refusals and money, that's the right side to err on.
 
-**The `tool_node` guardrails changed shape once, deliberately.** The
-eligibility-before-action guardrail originally *bounced* a premature
-`initiate_return` call back to the model with a text instruction to call
-`check_return_eligibility` first. That relies on the model reading a
-correction and retrying correctly — it didn't; it retried the same blocked
-call and escalated instead. The fix was to make the precondition
-mechanically satisfiable: the graph already has the order ID, so it resolves
-the order itself rather than asking the model to. The safety property this
-guardrail existed for (no invented item IDs) now lives in `_find_item`,
-which returns the real line items instead of letting the model guess — this
-is also what drives `test_ambiguous_item_reference_is_queried_not_guessed`.
+**Preconditions satisfied, not requested.** When `check_return_eligibility`
+was called before the order was established, the graph used to bounce it back
+with "call lookup_order first". The model retried the same blocked call and
+escalated. The graph now resolves the order itself. *Trade-off:* one fewer
+place the model is forced to demonstrate it understood — recovered by moving
+the safety property into `_find_item`, which returns real line items instead
+of guessing.
 
-**One redraft, then escalate — not a longer retry loop.** A second failed
-validation attempt escalates rather than trying a third time. Longer retry
-chains multiply latency and API cost for diminishing returns, and an honest
-handoff to a human beats sending a reply that's already failed automated
-review twice.
+**Verification as a hard gate.** Order tools are blocked until
+`verify_customer` succeeds, and exactly one code path can bind a session — with
+a test asserting that. It replaced a scheme that bound the session to whichever
+order was mentioned first, which prevented wandering but never established
+identity. *Trade-off:* every conversation costs an extra turn.
 
-**The multi-item validator fix trades a rare miss for a common false
-positive.** Documented in code and in `PROMPTS.md` §3: skipping the
-contradiction check when a turn has more than one eligibility result means a
-genuine contradiction across two items in one turn wouldn't be caught. That
-was accepted deliberately — the alternative (attempting per-item phrase
-attribution without the tool results carrying item identity) is real
-additional plumbing, and this project's actual production bugs were false
-rejections of correct replies, not undetected genuine ones.
+**Reply validation.** A deterministic check between draft and customer:
+contradictions, unsupported action claims, ungrounded policy figures,
+cross-customer names, sensitive-data requests, discounts. One redraft, then
+escalate. *Trade-off:* false positives. It has had exactly one, fixed by
+scoping grounding to the conversation while keeping action claims per-turn.
+
+**Two test layers.** Offline suites cover policy logic, validation and
+verification with no model; the live suite covers whether the model uses them
+correctly. This came from a real problem — a test asserting `escalated is
+True` passed during a total rate-limit outage, because everything escalated.
+Now a failure tells you immediately which half broke.
+
+**Record/replay cassettes.** Model calls are recorded once and replayed
+thereafter, so the full suite runs offline, deterministically, in seconds, and
+CI needs no API key. Free-tier limits (15 requests/minute) made a live suite
+unusable as a gate.
+
+**Provider as configuration.** Swapping Groq for Gemini touched the model
+constructor, two type annotations, and one serialisation boundary. The graph,
+tools, guardrails and tests were untouched. That's the payoff of keeping
+decisions in code — and it surfaced two integration details worth knowing:
+Gemini rejects `anyOf` in function declarations (so optional tool parameters
+need flattening), and returns content as blocks rather than a string.
+
+**Three access tiers.** The customer sees their own conversation and account.
+`/session/{id}` is protected only by an unguessable id. Operator routes
+(`/dashboard`, `/history`, `/metrics`, `/sessions`) require a token or a local
+request, and 404 otherwise so their existence isn't advertised.
+
+---
+
+## What it does
+
+Across twelve scripted conversations (37 turns) in the last full pass: **33
+turns closed without a human, 4 escalated** — two policy-mandated (a lost
+parcel and a genuine cross-customer dispute), two from free-tier rate limits
+rather than agent limitations. Zero guardrail failures; zero validation
+false positives.
+
+Deflection is visible live at `/dashboard`, split into policy-mandated
+handoffs (the system working as designed) and agent limitations (a backlog to
+fix) — the distinction an ops lead actually needs.
+
+Edge cases handled: partial shipments, delayed orders with the ₹250 credit
+(once, idempotently), lost parcels as claims rather than returns, cancelled
+orders, non-returnable categories, final-sale exchange-only, damaged items
+overriding the hygiene exclusion inside 48 hours, ambiguous item references,
+and orders belonging to someone else.
+
+---
 
 ## Known limitations
 
-- **In-memory idempotency, not persisted.** `_ISSUED_DELAY_CREDITS` and
-  `_OPEN_RETURNS` (both in `app/tools.py`) are process-local sets/dicts.
-  They correctly stop a duplicate action within one running process, but a
-  restart loses that state, and a real deployment needs this on the order
-  record itself, not in application memory.
-- **Multi-item validator gap**, as above — a genuine contradiction spanning
-  two items in the same turn currently isn't caught by `validate_node`.
-- **Retrieval doesn't scale past this document's size** — see trade-offs.
-- **No conversation-length cap.** `MAX_ITERATIONS = 6` bounds tool-call
-  loops within a single turn, but nothing bounds how long a session can run
-  or how large its message history grows, which is a real cost and latency
-  consideration for a long-running support chat.
-- **Two providers, both free-tier.** The system supports both Groq and
-  Gemini with a same-provider fallback model on failure
-  (`agent_node`'s retry loop), but there's no cross-provider fallback if an
-  entire provider is down — worth revisiting for production.
-- **Cassette fingerprinting is exact-match.** A cassette matches only an
-  identical conversation prefix (model name + full message history). This
-  is deliberate — it stops a stale recording being served silently after a
-  prompt or logic change — but it means any prompt edit requires
-  re-recording the whole affected scenario, not just the changed part.
+**Verification is identification, not authentication.** Knowing an email
+address opens an account. Real deployment needs an OTP to the contact on file,
+or a session token from an already-signed-in app. `/session/{id}` has the same
+shape of weakness: anyone holding the id can replay that conversation.
 
-## Five discovery questions for Trendly's ops team
+**Business days are approximated as calendar days.** Policy 1.2 and 1.5 both
+say "business days"; the code counts calendar days. No holiday calendar, and
+the dataset gives no way to infer one.
 
-1. **What's the actual distribution of the 70% "repetitive" volume across
-   order status, returns/exchanges, and policy questions** — and within
-   returns, how often is it single-item versus multi-item? The fixture data
-   here has 2 multi-item orders out of 10; if that ratio is much higher in
-   real volume, the multi-item validator gap above moves from "known
-   limitation" to "fix before launch."
-2. **Who actually resolves an `escalate_to_human` ticket, and on what
-   system?** The `escalate_to_human` tool generates a reference ID and a
-   summary, but that's designed against a guess of what a human agent needs
-   — I don't know if it's landing in a ticketing tool, a shared inbox, or
-   something else, and the summary format should match that destination.
-3. **Is `TRENDLY_NOW` (the frozen clock used for testing) something ops
-   would ever want exposed as a real "as-of" query** — e.g., for auditing
-   why a specific return was refused on a specific date — or is it purely a
-   testing artifact that should never exist in production?
-4. **What's the actual free-text volume this needs to handle** — do real
-   customers ask compound questions in one message ("where's my order AND
-   can I also ask about your return policy"), or is that rare enough not to
-   prioritize? I tested multi-item returns but not mixed-intent-category
-   messages, and don't know if that's a real pattern.
-5. **What happens when a customer disputes an eligibility outcome?** Policy
-   is applied deterministically here (window, category, final-sale), but
-   real support conversations sometimes involve a customer with a
-   legitimate exception the written policy doesn't anticipate. Is there a
-   defined override path, or does every dispute simply become an escalation
-   — and if the latter, is that an acceptable volume of escalations for the
-   ops team to absorb?
+**Idempotency is in-memory.** Duplicate returns and delay credits are blocked
+per process, not persisted. A restart or a second worker would forget.
+
+**Footwear's shoe-box rule is implemented but untested.** The only footwear
+order in the dataset never reaches the delivered state, so the ₹300 deduction
+branch can't be exercised against the fixed data.
+
+**The validator only sees one turn's tools.** A reply that refers to an action
+from a previous turn can't be verified against it, only against the fact that
+*some* grounding happened earlier.
+
+**Free-tier limits shape the experience.** 15 requests/minute on Flash-Lite,
+20/day on 3.6 Flash, and a turn costs 2–6 calls. The agent paces itself,
+honours the provider's retry hints and falls back to a second model, but under
+sustained load it degrades to escalation. Latency is 2–8s per turn, most of it
+model time.
+
+**Cost per conversation is unmeasured.** At 2,000 chats a day the token cost
+of a 6-call turn is a real budget line, and I haven't quantified it.
+
+---
+
+## Five questions for Trendly's ops team
+
+**1. How is a customer authenticated before an order is discussed?** Is there
+a session token from the app, or does support genuinely start from an email
+address? This decides whether the verification step is a real control or
+theatre — and it's the single biggest gap in what I've built.
+
+**2. What does "business days" mean operationally?** Which holiday calendar,
+and is it uniform across metros and partner-serviced pincodes? Every date
+calculation in the return window, delivery estimate and delay threshold
+depends on the answer.
+
+**3. Is the ₹250 delay credit once per order, or once per delay event?** A
+parcel delayed twice, or one order split across two shipments — does the
+customer get ₹250 or ₹500? Section 1.5 doesn't say, and it's the only
+money-issuing power the agent has.
+
+**4. What's the actual intake for damaged-item photographs, and what's the SLA
+once a ticket is raised?** The agent can't accept images, so every damaged
+claim becomes a handoff. If photos arrive by email or WhatsApp, that's a
+different integration and a different deflection ceiling.
+
+**5. What's the per-conversation cost ceiling, and what's the current cost per
+human-handled chat?** A 70% deflection target is only worth hitting if the
+agent is cheaper than the alternative. That number also decides how much
+model to buy — this workload runs on a small model precisely because the
+decisions live in code.
+
+---
+
+## What I'd do next
+
+1. **Real authentication** — OTP or session token. Everything else is downstream.
+2. **Persist idempotency and the delay-credit ledger** on the order record.
+3. **A retrieval eval set** for `search_policy` — labelled queries with
+   recall@1, so "I improved retrieval" becomes a number.
+4. **Cost per conversation** in the dashboard, alongside deflection.
+5. **Policy hot-reload with a coverage report** — swap `trendly_policy.md`
+   without redeploying, and flag clauses no tool implements. It would flag the
+   footwear box rule today.

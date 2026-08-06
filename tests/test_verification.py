@@ -100,3 +100,50 @@ def test_only_verification_can_bind_a_session():
     ]
     assert len(assignments) == 1, f"more than one binding path: {assignments}"
     assert 'result["customer_id"]' in assignments[0]
+
+
+# ---------------------------------------------------------- support hours
+
+@pytest.mark.parametrize(
+    "wall_utc,expect_open",
+    [
+        ("2026-08-06T12:00:00Z", True),    # 17:30 IST
+        ("2026-08-06T15:00:00Z", True),    # 20:30 IST, closing soon
+        ("2026-08-06T15:45:00Z", False),   # 21:15 IST, just closed
+        ("2026-08-06T21:30:00Z", False),   # 03:00 IST
+        ("2026-08-06T02:00:00Z", False),   # 07:30 IST, before opening
+        ("2026-08-06T03:35:00Z", True),    # 09:05 IST, just opened
+    ],
+)
+def test_support_hours_track_the_wall_clock(monkeypatch, wall_utc, expect_open):
+    from app.tools import support_status
+
+    monkeypatch.setenv("SUPPORT_NOW", wall_utc)
+    assert support_status()["open_now"] is expect_open
+
+
+def test_support_hours_ignore_the_frozen_dataset_clock(monkeypatch):
+    """
+    The two clocks must not be the same one. TRENDLY_NOW keeps the dataset's
+    return windows stable; reading it for support hours made the agent promise
+    "we're open until 9 PM IST" at three in the morning.
+    """
+    from app.tools import support_status
+
+    monkeypatch.setenv("TRENDLY_NOW", "2026-08-05T12:00:00Z")   # 17:30 IST, open
+    monkeypatch.setenv("SUPPORT_NOW", "2026-08-06T21:30:00Z")   # 03:00 IST, shut
+    assert support_status()["open_now"] is False
+
+
+def test_escalation_message_matches_the_hour(monkeypatch):
+    from app.tools import escalate_to_human
+
+    monkeypatch.setenv("SUPPORT_NOW", "2026-08-06T21:30:00Z")
+    closed = escalate_to_human.invoke({"summary": "s", "reason": "lost_parcel_claim"})
+    assert "offline" in closed["customer_message"]
+    assert "9 AM IST" in closed["customer_message"]
+
+    monkeypatch.setenv("SUPPORT_NOW", "2026-08-06T12:00:00Z")
+    open_now = escalate_to_human.invoke({"summary": "s", "reason": "lost_parcel_claim"})
+    assert "offline" not in open_now["customer_message"]
+    assert "shortly" in open_now["customer_message"]
