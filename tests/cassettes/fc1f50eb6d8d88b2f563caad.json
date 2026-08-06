@@ -1,5 +1,5 @@
 {
-  "content": "Hi! I see your order TR-4528 (the Oxford Shirt) which was delivered on July 19th. How can I help you with it today?",
+  "content": "I see your order TR-4528 for the Oxford Shirt, which was delivered a little while ago. How can I help you with it today?",
   "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",

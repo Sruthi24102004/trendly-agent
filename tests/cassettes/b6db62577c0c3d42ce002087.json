@@ -1,0 +1,8 @@
+{
+  "content": "I'm only able to discuss orders on your own account, so I can't pull up TR-4522. If it's yours, let me know and I'll take another look.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "b6db62577c0c3d42ce002087"
+  }
+}

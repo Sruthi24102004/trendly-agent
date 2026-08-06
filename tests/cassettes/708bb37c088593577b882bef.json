@@ -5,10 +5,10 @@
       "name": "check_return_eligibility",
       "args": {
         "item_id": "TR-SCF-027",
-        "order_id": "TR-4529",
-        "issue_type": "change_of_mind"
+        "issue_type": "change_of_mind",
+        "order_id": "TR-4529"
       },
-      "id": "Pwo6apTu"
+      "id": "Un9AYXFl"
     }
   ],
   "_meta": {

@@ -1,14 +1,6 @@
 {
-  "content": "",
-  "tool_calls": [
-    {
-      "name": "apply_delayed_credit",
-      "args": {
-        "order_id": "TR-4524"
-      },
-      "id": "NUWhEhdM"
-    }
-  ],
+  "content": "That's because your order was sent out as a partial shipment! \n\nThe High-Rise Straight Jeans shipped out first, while the Woven Leather Belt was on backorder. The belt is scheduled to ship separately as soon as it's back in stock on August 9, at no extra shipping cost to you.",
+  "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",
     "key": "823580eb86f4fd27d18aa3de"

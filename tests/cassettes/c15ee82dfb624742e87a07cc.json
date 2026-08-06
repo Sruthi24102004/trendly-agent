@@ -1,0 +1,8 @@
+{
+  "content": "It's still showing as delayed with BlueDart under tracking number BD8870553301. Since it's quite a bit past its expected delivery date, would you like me to hand this over to a human colleague to investigate further with the courier?",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "c15ee82dfb624742e87a07cc"
+  }
+}

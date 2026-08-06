@@ -146,7 +146,6 @@ def _action_supported(claim: str, tool_results: list[dict]) -> bool:
         return False
     return True
 
-
 def validate_reply(
     reply: str,
     tool_results: list[dict],

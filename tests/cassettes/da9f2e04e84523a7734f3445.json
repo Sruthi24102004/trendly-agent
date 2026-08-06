@@ -2,27 +2,18 @@
   "content": "",
   "tool_calls": [
     {
-      "name": "lookup_order",
-      "args": {
-        "order_id": "TR-4523"
-      },
-      "id": "zbQdwcJX"
-    },
-    {
       "name": "search_policy",
       "args": {
         "topic": "return window"
       },
-      "id": "VYxh1MnM"
+      "id": "y3Shle8L"
     },
     {
-      "name": "check_return_eligibility",
+      "name": "lookup_order",
       "args": {
-        "issue_type": "change_of_mind",
-        "item_id": "TR-JKT-008",
         "order_id": "TR-4523"
       },
-      "id": "QKGIvlUZ"
+      "id": "RBMRKDkn"
     }
   ],
   "_meta": {

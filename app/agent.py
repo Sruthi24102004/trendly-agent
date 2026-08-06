@@ -203,6 +203,7 @@ class AgentState(TypedDict):
     iteration: int                        # per turn
     validation_retries: int               # per turn
     last_violations: list                 # per turn — surfaced in diagnostics
+    rejected_drafts: list                 # per turn — [{draft, violations}], for diagnostics/tests
     model_used: str | None                # per turn — which model answered
     fallback_used: bool                   # per turn
     escalation_reason: str | None         # per turn — why a human was needed
@@ -536,6 +537,11 @@ def validate_node(state: AgentState) -> dict:
     codes = [v["code"] for v in violations]
     print(f"[validate_node] rejected reply (attempt {retries + 1}): {codes}")
 
+    # rejected_drafts isn't an Annotated/merged field, so read-then-append
+    # here to keep every draft from this turn, not just the latest.
+    rejected_drafts = list(state.get("rejected_drafts") or [])
+    rejected_drafts.append({"draft": reply, "violations": codes})
+
     if retries >= 1:
         # One corrective attempt already failed. Escalating beats sending a
         # reply we know to be wrong.
@@ -553,6 +559,7 @@ def validate_node(state: AgentState) -> dict:
             "escalation_reason": "reply_validation_failed",
             "last_violations": violations,
             "validation_retries": retries + 1,
+            "rejected_drafts": rejected_drafts,
         }
 
     return {
@@ -564,6 +571,7 @@ def validate_node(state: AgentState) -> dict:
         ],
         "validation_retries": retries + 1,
         "last_violations": violations,
+        "rejected_drafts": rejected_drafts,
     }
 
 
@@ -639,6 +647,7 @@ def run_agent(session_id: str, user_message: str) -> dict:
             "escalation_reason": None,
             "validation_retries": 0,
             "last_violations": [],
+            "rejected_drafts": [],
             "model_used": None,
             "fallback_used": False,
         },
@@ -680,6 +689,7 @@ def run_agent(session_id: str, user_message: str) -> dict:
         "latency_ms": latency_ms,
         "blocked_calls": blocked_calls,
         "validation_violations": violations,
+        "rejected_drafts": result.get("rejected_drafts") or [],
         "escalation_reason": result.get("escalation_reason"),
     }
 

@@ -1,5 +1,5 @@
 {
-  "content": "That Oxford Shirt was a final sale item, so it's eligible for a size exchange only — I can't issue a refund on it. If you tell me the size you need, I can raise the exchange. \n\nAlso, we never ask for bank account details here in chat to keep your financial information secure.",
+  "content": "I can't issue a refund for that Oxford Shirt as it was a final sale item, so we don't need any bank details from you. It is, however, eligible for a size exchange if you'd like a different size instead. \n\nWould you like to exchange it for a different size?",
   "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",

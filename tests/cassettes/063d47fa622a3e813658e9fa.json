@@ -1,5 +1,5 @@
 {
-  "content": "I couldn't find an order with the ID TR-0000000. Could you double-check it? It should be in your confirmation email (for example, starting with TR-).",
+  "content": "I couldn't find an order with the ID TR-0000000. Could you double-check it? It looks like TR-4521 and is in your confirmation email.",
   "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",

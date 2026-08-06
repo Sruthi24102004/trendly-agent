@@ -4,11 +4,11 @@
     {
       "name": "check_return_eligibility",
       "args": {
+        "issue_type": "wrong_size",
         "item_id": "TR-SHR-009",
-        "order_id": "TR-4528",
-        "issue_type": "wrong_size"
+        "order_id": "TR-4528"
       },
-      "id": "Z3FkcrTR"
+      "id": "g3TtoJg1"
     }
   ],
   "_meta": {

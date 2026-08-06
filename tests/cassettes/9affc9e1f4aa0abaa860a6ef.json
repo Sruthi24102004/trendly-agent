@@ -4,9 +4,16 @@
     {
       "name": "search_policy",
       "args": {
-        "topic": "lost in transit delayed order"
+        "topic": "lost order"
       },
-      "id": "rEVhxrTo"
+      "id": "Tpe6laH4"
+    },
+    {
+      "name": "apply_delayed_credit",
+      "args": {
+        "order_id": "TR-4526"
+      },
+      "id": "HAlvAT4a"
     }
   ],
   "_meta": {

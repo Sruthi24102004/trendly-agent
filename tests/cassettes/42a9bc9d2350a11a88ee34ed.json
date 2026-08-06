@@ -1,5 +1,5 @@
 {
-  "content": "I see that your order of the Court Sneakers (TR-4525) is currently delayed — I'm really sorry about that wait. \n\nThe ₹250 delayed-delivery credit has already been added to your account for this order, which will show at checkout. Is there something specific you'd like to know or do regarding the delivery?",
+  "content": "I can see that your order for the Court Sneakers (TR-4525) is currently delayed — it was expected by July 15th, and I'm really sorry for the wait. \n\nThe ₹250 delay credit for this order has already been added to your account, which you'll see at checkout. Would you like me to look into anything else regarding this order, or check on its current tracking with BlueDart (BD8870553301)?",
   "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",

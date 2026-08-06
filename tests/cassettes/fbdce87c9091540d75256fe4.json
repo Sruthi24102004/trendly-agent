@@ -1,0 +1,8 @@
+{
+  "content": "I see your order TR-4522 with the Everyday Cotton Tee and Ankle Socks 3-pack, which was delivered on July 14. \n\nCould you let me know a bit more about what's not right with them—are they the wrong size, damaged, or something else?",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "fbdce87c9091540d75256fe4"
+  }
+}

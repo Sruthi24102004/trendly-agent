@@ -1,5 +1,5 @@
 {
-  "content": "Could you share your order ID? It usually starts with \"TR-\" and you'll find it in your confirmation email.",
+  "content": "I can't look up your order without an order ID—could you share it? It usually looks like TR-XXXX and you'll find it in your confirmation email.",
   "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",

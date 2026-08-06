@@ -1,0 +1,27 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "check_return_eligibility",
+      "args": {
+        "order_id": "TR-4522",
+        "item_id": "TR-TSH-002",
+        "issue_type": "change_of_mind"
+      },
+      "id": "7JZvrd2e"
+    },
+    {
+      "name": "check_return_eligibility",
+      "args": {
+        "item_id": "TR-SOK-031",
+        "order_id": "TR-4522",
+        "issue_type": "change_of_mind"
+      },
+      "id": "evu2LHps"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "ba9d2c34a062c1db9ad9a88f"
+  }
+}

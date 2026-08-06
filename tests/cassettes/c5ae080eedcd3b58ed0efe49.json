@@ -1,0 +1,8 @@
+{
+  "content": "Express shipping is a flat ₹199, though it isn't available for cash-on-delivery orders.",
+  "tool_calls": [],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "c5ae080eedcd3b58ed0efe49"
+  }
+}

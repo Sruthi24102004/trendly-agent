@@ -1,0 +1,19 @@
+{
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "initiate_return",
+      "args": {
+        "reason": "change_of_mind",
+        "order_id": "TR-4530",
+        "resolution": "refund",
+        "item_id": "TR-KRT-033"
+      },
+      "id": "GJVAX0ag"
+    }
+  ],
+  "_meta": {
+    "model": "gemini-3.5-flash-lite",
+    "key": "ed29dbf87c70bd46ed3a4914"
+  }
+}

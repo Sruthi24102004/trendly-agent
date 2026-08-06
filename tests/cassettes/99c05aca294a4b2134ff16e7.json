@@ -4,11 +4,11 @@
     {
       "name": "check_return_eligibility",
       "args": {
+        "order_id": "TR-4527",
         "item_id": "TR-EAR-042",
-        "issue_type": "change_of_mind",
-        "order_id": "TR-4527"
+        "issue_type": "change_of_mind"
       },
-      "id": "BnAOdqeZ"
+      "id": "jjL9zk57"
     }
   ],
   "_meta": {

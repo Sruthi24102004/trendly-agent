@@ -1,5 +1,5 @@
 {
-  "content": "That Oxford Shirt was a final sale item, so it's eligible for a size exchange only — I can't issue a refund or store credit on it. If you tell me the size you need, I can raise the exchange.",
+  "content": "That Oxford Shirt was a final sale item, so it's eligible for a size exchange only—I can't issue a refund on it. Which size would you like instead?",
   "tool_calls": [],
   "_meta": {
     "model": "gemini-3.5-flash-lite",
