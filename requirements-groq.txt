@@ -1,0 +1,5 @@
+# Optional: only needed when LLM_PROVIDER=groq.
+# Not in requirements.txt because langchain-groq 0.2.0 pins langchain-core<0.4,
+# which conflicts with the langchain-core>=1.5.1 that langchain-google-genai needs.
+# Install into a separate environment if you want to run the Groq provider.
+langchain-groq
