@@ -165,7 +165,24 @@ opens with it:
 > you must not confirm an order exists, describe it, or act on it — not even
 > to say "I can't find that order", which itself tells them something.
 
-### v8 — a stale example resurrected deleted wording
+### v8 — scope
+
+The agent wrote a poem on request, answered "what is 2+2", and responded to
+"delete my email ID" with a bare ticket number and no explanation.
+
+None of these is harmful on its own. The problem is what they signal: an agent
+with no boundary is one a customer will keep testing, and every answer outside
+the policy document is ungrounded by definition. Two rules and three examples
+were added — decline warmly and redirect, and for account or data requests,
+explain what you can't do and who will handle it *before* escalating.
+
+The reasoning given to the model mattered more than the prohibition:
+
+> Don't answer "just this once" because it's harmless; a support agent that
+> does arithmetic on request is one a customer will try to talk into other
+> things too.
+
+### v9 — a stale example resurrected deleted wording
 
 Weeks after removing the phrase *"If it's yours, let me know and I'll take
 another look"* — deleted because the agent cannot verify an ownership claim,

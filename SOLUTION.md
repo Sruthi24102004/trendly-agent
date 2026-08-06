@@ -85,9 +85,13 @@ unusable as a gate.
 **Provider as configuration.** Swapping Groq for Gemini touched the model
 constructor, two type annotations, and one serialisation boundary. The graph,
 tools, guardrails and tests were untouched. That's the payoff of keeping
-decisions in code — and it surfaced two integration details worth knowing:
-Gemini rejects `anyOf` in function declarations (so optional tool parameters
-need flattening), and returns content as blocks rather than a string.
+decisions in code — and it surfaced three things worth knowing: Gemini rejects
+`anyOf` in function declarations (so optional tool parameters need
+flattening), it returns content as blocks rather than a string, and the two
+SDKs cannot currently share a Python environment at all, because
+`langchain-groq` is a major version behind on `langchain-core`. The
+abstraction holds; the ecosystem doesn't. The Groq path is kept, with its
+dependency isolated in `requirements-groq.txt`.
 
 **Three access tiers.** The customer sees their own conversation and account.
 `/session/{id}` is protected only by an unguessable id. Operator routes
@@ -137,6 +141,13 @@ branch can't be exercised against the fixed data.
 **The validator only sees one turn's tools.** A reply that refers to an action
 from a previous turn can't be verified against it, only against the fact that
 *some* grounding happened earlier.
+
+**The deployed instance is a demonstration, not a deployment.** Render's free
+tier sleeps after ~15 minutes and runs on an ephemeral disk, so conversation
+state and the event log are wiped on every restart — the dashboard reads zero
+on a cold instance. Everything is single-process: the SQLite checkpointer, the
+in-memory idempotency guards and the throttle all assume one worker. Scaling
+out needs a shared store for all three.
 
 **Free-tier limits shape the experience.** 15 requests/minute on Flash-Lite,
 20/day on 3.6 Flash, and a turn costs 2–6 calls. The agent paces itself,

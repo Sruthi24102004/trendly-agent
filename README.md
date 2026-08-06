@@ -1,5 +1,17 @@
 # Trendly Support Agent
 
+**Live:** <https://trendly-agent-z7ll.onrender.com>
+**Operator views:** [dashboard](https://trendly-agent-z7ll.onrender.com/dashboard?token=IhaNx0IQEVmdWL9Sd_-iDXcjl9NxPdMS8f2v52qTSoM) · [conversation history](https://trendly-agent-z7ll.onrender.com/history?token=IhaNx0IQEVmdWL9Sd_-iDXcjl9NxPdMS8f2v52qTSoM)
+**Account switcher** (evaluation convenience): [https://trendly-agent-z7ll.onrender.com/?token=…](https://trendly-agent-z7ll.onrender.com/?token=IhaNx0IQEVmdWL9Sd_-iDXcjl9NxPdMS8f2v52qTSoM)
+
+The customer chat at `/` needs no token. The operator routes show every
+conversation across all customers, so they're gated — 404 without a valid
+token, deliberately, so the surface isn't discoverable. The token is needed
+once per browser; it sets a cookie after that.
+
+Free instance: it sleeps after ~15 minutes idle, so the first request after a
+quiet spell takes 30–60 seconds to wake. That's the platform, not the agent.
+
 A tool-calling support agent for Trendly, a direct-to-consumer fashion
 retailer. It handles order status, returns, exchanges, refunds and policy
 questions across multi-turn conversations, and hands off to a human when it
@@ -12,6 +24,10 @@ precondition and every refusal is enforced in the graph, where it can be
 tested without an API key.
 
 ---
+
+See **[FEATURES.md](FEATURES.md)** for a walkthrough of everything the agent
+does, **[PROMPTS.md](PROMPTS.md)** for how the prompt got to its current shape,
+and **[SOLUTION.md](SOLUTION.md)** for architecture, trade-offs and limitations.
 
 ## Quick start
 
@@ -186,6 +202,48 @@ data/               orders.json and trendly_policy.md, unmodified
 ```
 
 ---
+
+## Deployment
+
+Deployed on Render's free tier. The repo also runs with one command, and for
+evaluation that's the better path — no cold start, no shared rate limit, and
+the operator views open without a token.
+
+**To deploy your own:**
+
+1. Push to GitHub, then Render → New → Web Service → connect the repo.
+   - Build: `pip install -r requirements.txt`
+   - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - Health check: `/health`
+2. Set `GEMINI_API_KEY` and `ADMIN_TOKEN` in Render's Environment tab, plus
+   `PYTHON_VERSION=3.12.7`. `render.yaml` documents the rest.
+
+**Dependency notes, learned the hard way.** Four clean-build failures, each a
+real constraint that a working local environment had been hiding:
+
+- Python 3.14 has no wheels yet for several packages here — pinned to 3.12.
+- `httpx` had to move from `==0.27.2` to `>=0.28.1`; `google-genai` requires it.
+- `langgraph 0.2.x` pins `langchain-core<0.4`, which `langchain-google-genai 4.x`
+  can't satisfy. Upgraded langgraph rather than downgrade the Google SDK.
+- `langchain-groq 0.2.0` pins `langchain-core<0.4` too, and has no release that
+  works with 1.x. It is **not** in `requirements.txt` — see
+  `requirements-groq.txt`. The Groq code path still exists and its import is
+  local to the function, so nothing breaks; it just can't share an environment
+  with the Gemini SDK today.
+
+The last one is worth stating plainly: the provider abstraction is sound —
+swapping vendors touched a constructor, two annotations and one serialisation
+boundary — but the two SDKs currently can't co-exist, because `langchain-groq`
+is a major version behind on `langchain-core`.
+
+**What to expect from a free instance.** It sleeps after ~15 minutes idle and
+takes 30–60s to wake, so the first request after a quiet spell is slow — that's
+the platform, not the agent. Conversation state lives in SQLite on an ephemeral
+disk, so a restart clears transcripts and metrics; the code doesn't care, but
+the dashboard will read zero afterwards. And the Gemini free tier allows 15
+requests a minute *in total*, so concurrent visitors will see the agent fall
+back to its second model and, under real load, escalate. Running it locally
+with your own key avoids all three.
 
 ## Known constraints
 
